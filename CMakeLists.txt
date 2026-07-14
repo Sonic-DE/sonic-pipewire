@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(KPipewire)
-set(PROJECT_VERSION "6.7.4")
+set(PROJECT_VERSION "6.7.3")
 string(REPLACE "." ";" VERSION_LIST ${PROJECT_VERSION})
 list(GET VERSION_LIST 0 PROJECT_VERSION_MAJOR)
 list(GET VERSION_LIST 1 PROJECT_VERSION_MINOR)
@@ -43,11 +43,9 @@ pkg_check_modules(LIBVA-drm IMPORTED_TARGET libva-drm REQUIRED)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # add clang-format target for all our real source files
 file(GLOB_RECURSE ALL_CLANG_FORMAT_SOURCE_FILES *.cpp *.h)
-list(FILTER ALL_CLANG_FORMAT_SOURCE_FILES EXCLUDE REGEX ".*\\.ccls-cache/.*")
 kde_clang_format(${ALL_CLANG_FORMAT_SOURCE_FILES})
 kde_configure_git_pre_commit_hook(CHECKS CLANG_FORMAT)
 
@@ -61,8 +59,9 @@ ecm_set_disabled_deprecation_versions(QT 6.11.0
 )
 
 if (BUILD_TESTING)
+   find_package(PlasmaWaylandProtocols REQUIRED)
    include(ECMAddTests)
-   find_package(Qt6 REQUIRED COMPONENTS Test QuickTest QuickControls2)
+   find_package(Qt6 REQUIRED COMPONENTS Test QuickTest)
 
    add_subdirectory(autotests)
    add_subdirectory(tests)
