@@ -39,3 +39,37 @@ ecm_add_test(TEST_NAME TestEncoder
 )
 
 target_include_directories(TestEncoder PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/src)
+
+ecm_add_test(TEST_NAME TestPipeWireFrameData
+    TestPipeWireFrameData.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipewireframeutils_p.cpp
+    ${CMAKE_BINARY_DIR}/src/logging.cpp
+
+    LINK_LIBRARIES
+    Qt6::Gui
+    Qt6::Test
+    KPipeWire
+    PkgConfig::PipeWire
+)
+
+target_include_directories(TestPipeWireFrameData PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/src)
+
+ecm_add_test(TEST_NAME TestDmaBufEglSetup
+    TestDmaBufEglSetup.cpp
+    ${CMAKE_SOURCE_DIR}/src/dmabufeglsetup.cpp
+    ${CMAKE_SOURCE_DIR}/src/glhelpers.cpp
+    ${CMAKE_SOURCE_DIR}/src/rendernodecontext.cpp
+    ${CMAKE_BINARY_DIR}/src/logging.cpp
+    ${CMAKE_BINARY_DIR}/src/logging_dmabuf.cpp
+
+    LINK_LIBRARIES
+    Qt6::Gui
+    Qt6::GuiPrivate
+    Qt6::Test
+    KPipeWire
+    PkgConfig::GBM
+    epoxy::epoxy
+    Libdrm::Libdrm
+)
+
+target_include_directories(TestDmaBufEglSetup PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_BINARY_DIR}/src)

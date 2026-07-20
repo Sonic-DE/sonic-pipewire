@@ -6,6 +6,7 @@
 
 #include "pwhelpers.h"
 #include "logging.h"
+#include "pipewireframeutils_p.h"
 
 QImage::Format SpaToQImageFormat(quint32 format)
 {
@@ -60,10 +61,14 @@ QImage PipeWireFrameData::toImage() const
 
 std::shared_ptr<PipeWireFrameData> PipeWireFrameData::copy() const
 {
-    const uint bufferSize = size.height() * stride * 4;
-    auto newMap = malloc(bufferSize);
-    memcpy(newMap, data, bufferSize);
-    return std::make_shared<PipeWireFrameData>(format, newMap, size, stride, new PipeWireFrameCleanupFunction([newMap] {
-                                                   free(newMap);
-                                               }));
+    const auto bufferSize = PipeWireFrameUtils::checkedImageBytes(size, stride);
+    if (!data || !bufferSize) {
+        qCWarning(PIPEWIRE_LOGGING) << "cannot copy invalid PipeWireFrameData" << size << stride;
+        return {};
+    }
+
+    auto storage = new QByteArray(static_cast<const char*>(data), qsizetype(*bufferSize));
+    return std::make_shared<PipeWireFrameData>(format, storage->data(), size, stride, new PipeWireFrameCleanupFunction([storage] {
+        delete storage;
+    }));
 }

@@ -57,6 +57,7 @@ ecm_qt_install_logging_categories(
 
 target_sources(KPipeWire PRIVATE
     pipewirecore.cpp
+    pipewireframeutils_p.cpp
     pipewiresourceitem.cpp
     pipewiresourcestream.cpp
     rendernodecontext.cpp
@@ -100,7 +101,7 @@ install(FILES
   DESTINATION ${KDE_INSTALL_INCLUDEDIR}/KPipeWire COMPONENT Devel
 )
 
-add_library(KPipeWireDmaBuf dmabufhandler.cpp rendernodecontext.cpp ${kpipewiredmabuf_SRCS})
+add_library(KPipeWireDmaBuf dmabufhandler.cpp dmabufeglsetup.cpp rendernodecontext.cpp ${kpipewiredmabuf_SRCS})
 target_link_libraries(KPipeWireDmaBuf PUBLIC KPipeWire
     PRIVATE Qt::Core Qt::Gui PkgConfig::GBM
     epoxy::epoxy Libdrm::Libdrm Qt::GuiPrivate

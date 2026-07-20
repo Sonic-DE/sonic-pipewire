@@ -5,6 +5,10 @@
 */
 
 #include "RecordMe.h"
+
+#include <QCoreApplication>
+#include <QDBusConnectionInterface>
+#include <QGuiApplication>
 #include <QLoggingCategory>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -13,6 +17,19 @@
 #include "xdp_dbus_screencast_interface.h"
 
 Q_DECLARE_METATYPE(Stream)
+
+namespace {
+QString optionKeys(const QVariantMap& options)
+{
+    QStringList keys;
+    keys.reserve(options.size());
+    for (auto it = options.cbegin(); it != options.cend(); ++it) {
+        keys.push_back(it.key());
+    }
+    keys.sort();
+    return keys.join(QLatin1Char(','));
+}
+}
 
 QDebug operator<<(QDebug debug, const Stream& plug)
 {
@@ -53,13 +70,18 @@ const QDBusArgument &operator>>(const QDBusArgument &argument, QList<Stream> &st
 RecordMe::RecordMe(QObject* parent)
     : QObject(parent)
     , iface(new OrgFreedesktopPortalScreenCastInterface(
-        QLatin1String("org.freedesktop.portal.Desktop"), QLatin1String("/org/freedesktop/portal/desktop"), QDBusConnection::sessionBus(), this))
+          QLatin1String("org.freedesktop.portal.Desktop"), QLatin1String("/org/freedesktop/portal/desktop"), QDBusConnection::sessionBus(), this))
     , m_durationTimer(new QTimer(this))
-    , m_handleToken(QStringLiteral("RecordMe%1").arg(QRandomGenerator::global()->generate()))
+    , m_handleToken(QStringLiteral("Preview%1").arg(QRandomGenerator::global()->generate()))
     , m_engine(new QQmlApplicationEngine(this))
 {
     m_engine->rootContext()->setContextProperty(QStringLiteral("app"), this);
     m_engine->load(QUrl(QStringLiteral("qrc:/main.qml")));
+    if (m_engine->rootObjects().isEmpty()) {
+        qWarning() << "Could not load portal preview UI";
+        abortWithError(1);
+        return;
+    }
 
     // create session
     const auto sessionParameters = QVariantMap {
@@ -68,9 +90,9 @@ RecordMe::RecordMe(QObject* parent)
     };
     auto sessionReply = iface->CreateSession(sessionParameters);
     sessionReply.waitForFinished();
-    if (!sessionReply.isValid()) {
-        qWarning("Couldn't initialize the remote control session");
-        exit(1);
+    if (sessionReply.isError()) {
+        logReplyError("CreateSession", sessionReply.error());
+        abortWithError(1);
         return;
     }
 
@@ -81,8 +103,8 @@ RecordMe::RecordMe(QObject* parent)
                                                            this,
                                                            SLOT(response(uint, QVariantMap)));
     if (!ret) {
-        qWarning() << "failed to create session";
-        exit(2);
+        qWarning() << "Failed to connect portal preview request response" << sessionReply.value().path();
+        abortWithError(2);
         return;
     }
 
@@ -90,47 +112,60 @@ RecordMe::RecordMe(QObject* parent)
     qDBusRegisterMetaType<QList<Stream>>();
 
     m_durationTimer->setSingleShot(true);
+    connect(m_durationTimer, &QTimer::timeout, this, &RecordMe::closeSessionAndQuit);
 }
 
 RecordMe::~RecordMe() = default;
 
+int RecordMe::exitCode() const
+{
+    return m_exitCode;
+}
+
 void RecordMe::init(const QDBusObjectPath& path)
 {
     m_path = path;
-    {
-        uint32_t cursor_mode;
-        if (iface->availableCursorModes() & Metadata) {
-            cursor_mode = Metadata;
-        } else {
-            cursor_mode = Hidden;
-        }
-        QVariantMap sourcesParameters = {{QLatin1String("handle_token"), m_handleToken},
-                                         {QLatin1String("types"), iface->availableSourceTypes()},
-                                         {QLatin1String("multiple"), false}, // for now?
-                                         {QLatin1String("cursor_mode"), uint(cursor_mode)},
-                                         {QLatin1String("persist_mode"), uint(m_persistMode)}};
 
-        if (!m_restoreToken.isEmpty()) {
-            sourcesParameters[QLatin1String("restore_token")] = m_restoreToken;
-        }
-
-        auto reply = iface->SelectSources(m_path, sourcesParameters);
-        reply.waitForFinished();
-
-        if (reply.isError()) {
-            qWarning() << "Could not select sources" << reply.error();
-            exit(1);
-            return;
-        }
-        qDebug() << "select sources done" << reply.value().path();
+    const uint availableSourceTypes = iface->availableSourceTypes();
+    const uint availableCursorModes = iface->availableCursorModes();
+    const uint version = iface->version();
+    if (!validateCapabilities(availableSourceTypes,
+            availableCursorModes,
+            version,
+            iface->service(),
+            QGuiApplication::platformName(),
+            qEnvironmentVariable("XDG_CURRENT_DESKTOP"))) {
+        abortWithError(1);
+        return;
     }
+
+    const uint cursorMode = selectCursorMode(availableCursorModes);
+    QVariantMap sourcesParameters = {{QLatin1String("handle_token"), m_handleToken},
+        {QLatin1String("types"), availableSourceTypes},
+        {QLatin1String("multiple"), false},
+        {QLatin1String("cursor_mode"), cursorMode},
+        {QLatin1String("persist_mode"), uint(m_persistMode)}};
+
+    if (!m_restoreToken.isEmpty()) {
+        sourcesParameters[QLatin1String("restore_token")] = m_restoreToken;
+    }
+
+    auto reply = iface->SelectSources(m_path, sourcesParameters);
+    reply.waitForFinished();
+
+    if (reply.isError()) {
+        logReplyError("SelectSources", reply.error(), {}, m_path);
+        abortWithError(1);
+        return;
+    }
+    qDebug() << "Portal preview source selection requested" << reply.value().path() << "cursorMode" << cursorMode;
 }
 
 void RecordMe::response(uint code, const QVariantMap& results)
 {
     if (code > 0) {
-        qWarning() << "error!!!" << code << results;
-        exit(666);
+        qWarning() << "Portal preview request failed" << code << results;
+        abortWithError(1);
         return;
     }
 
@@ -170,15 +205,20 @@ void RecordMe::start()
     reply.waitForFinished();
 
     if (reply.isError()) {
-        qWarning() << "Could not start stream" << reply.error();
-        exit(1);
+        logReplyError("Start", reply.error(), {}, m_path);
+        abortWithError(1);
         return;
     }
-    qDebug() << "started!" << reply.value().path();
+    qDebug() << "Portal preview started" << reply.value().path();
 }
 
 void RecordMe::handleStreams(const QList<Stream> &streams)
 {
+    if (!validateStreams(streams)) {
+        abortWithError(1);
+        return;
+    }
+
     const QVariantMap startParameters = {
         { QLatin1String("handle_token"), m_handleToken }
     };
@@ -187,25 +227,37 @@ void RecordMe::handleStreams(const QList<Stream> &streams)
     reply.waitForFinished();
 
     if (reply.isError()) {
-        qWarning() << "Could not start stream" << reply.error();
-        exit(1);
+        logReplyError("OpenPipeWireRemote", reply.error(), {}, m_path);
+        abortWithError(1);
         return;
     }
 
-    const int fd = reply.value().takeFileDescriptor();
+    PortalUniqueFd originalFd(reply.value().takeFileDescriptor());
+    auto duplicatedFds = portalDuplicateFdForStreams(std::move(originalFd), streams.size(), m_duplicateFdFunction);
+    if (!duplicatedFds) {
+        qWarning() << "Could not duplicate PipeWire remote descriptor for portal preview streams" << streams.size();
+        abortWithError(1);
+        return;
+    }
 
     const auto roots = m_engine->rootObjects();
-    for (const auto &stream : streams) {
+    for (qsizetype i = 0; i < streams.size(); ++i) {
+        const auto& stream = streams.at(i);
+        qDebug() << "Installing portal preview stream" << stream.id << "optionKeys" << optionKeys(stream.opts);
         for (auto root : roots) {
             auto mo = root->metaObject();
-            qDebug() << "feeding..." << stream.id << fd;
             mo->invokeMethod(root,
-                             "addStream",
-                             Q_ARG(QVariant, QVariant::fromValue<quint32>(stream.id)),
-                             Q_ARG(QVariant, m_handleToken),
-                             Q_ARG(QVariant, fd),
-                             Q_ARG(QVariant, true));
+                "addStream",
+                Q_ARG(QVariant, QVariant::fromValue<quint32>(stream.id)),
+                Q_ARG(QVariant, QStringLiteral("Portal stream %1").arg(stream.id)),
+                Q_ARG(QVariant, duplicatedFds->at(static_cast<size_t>(i)).release()),
+                Q_ARG(QVariant, true));
         }
+    }
+
+    m_streamInstalled = true;
+    if (m_durationTimer->interval() > 0) {
+        m_durationTimer->start();
     }
 }
 
@@ -222,6 +274,97 @@ void RecordMe::setRestoreToken(const QString &restoreToken)
 void RecordMe::setDuration(int duration)
 {
     m_durationTimer->setInterval(duration);
+}
+
+void RecordMe::setDuplicateFdFunction(PortalDuplicateFdFunction duplicateFdFunction)
+{
+    m_duplicateFdFunction = std::move(duplicateFdFunction);
+}
+
+void RecordMe::startDurationTimerForTest()
+{
+    if (m_durationTimer->interval() > 0 && m_streamInstalled) {
+        m_durationTimer->start();
+    }
+}
+
+bool RecordMe::durationTimerIsActiveForTest() const
+{
+    return m_durationTimer->isActive();
+}
+
+uint RecordMe::selectCursorMode(uint availableCursorModes)
+{
+    if (availableCursorModes & Metadata) {
+        return Metadata;
+    }
+    if (availableCursorModes & Embedded) {
+        return Embedded;
+    }
+    return Hidden;
+}
+
+bool RecordMe::validateCapabilities(uint availableSourceTypes, uint availableCursorModes, uint version, const QString& service, const QString& platform, const QString& desktop)
+{
+    qInfo() << "Portal preview capabilities"
+            << "service" << service << "platform" << platform << "desktop" << desktop << "version" << version << "sourceModes" << availableSourceTypes
+            << "cursorModes" << availableCursorModes;
+
+    if (availableSourceTypes == 0) {
+        qWarning() << "Portal preview cannot select sources because AvailableSourceTypes is zero";
+        return false;
+    }
+    if (availableCursorModes == 0) {
+        qWarning() << "Portal preview cannot select sources because AvailableCursorModes is zero";
+        return false;
+    }
+    return true;
+}
+
+bool RecordMe::validateStreams(const QList<Stream>& streams)
+{
+    if (streams.isEmpty()) {
+        qWarning() << "Portal preview received no streams";
+        return false;
+    }
+
+    for (const auto& stream : streams) {
+        if (stream.id == 0) {
+            qWarning() << "Portal preview received invalid zero PipeWire node" << "optionKeys" << optionKeys(stream.opts);
+            return false;
+        }
+        qDebug() << "Portal preview stream response" << stream.id << "optionKeys" << optionKeys(stream.opts);
+    }
+    return true;
+}
+
+void RecordMe::closeSessionAndQuit()
+{
+    if (!m_path.path().isEmpty()) {
+        QDBusMessage closeMessage = QDBusMessage::createMethodCall(QStringLiteral("org.freedesktop.portal.Desktop"),
+            m_path.path(),
+            QStringLiteral("org.freedesktop.portal.Session"),
+            QStringLiteral("Close"));
+        QDBusConnection::sessionBus().asyncCall(closeMessage);
+    }
+
+    QCoreApplication::quit();
+}
+
+void RecordMe::abortWithError(int exitCode)
+{
+    if (m_exitCode != 0) {
+        return;
+    }
+    m_exitCode = exitCode;
+    Q_EMIT failed(exitCode);
+}
+
+bool RecordMe::logReplyError(const char* action, const QDBusError& error, const QDBusObjectPath& requestPath, const QDBusObjectPath& sessionPath) const
+{
+    qWarning() << "Portal preview D-Bus error" << action << "name" << error.name() << "message" << error.message() << "requestPath" << requestPath.path()
+               << "sessionPath" << sessionPath.path();
+    return true;
 }
 
 #include "moc_RecordMe.cpp"

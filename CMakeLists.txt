@@ -61,9 +61,8 @@ ecm_set_disabled_deprecation_versions(QT 6.11.0
 )
 
 if (BUILD_TESTING)
-   find_package(PlasmaWaylandProtocols REQUIRED)
    include(ECMAddTests)
-   find_package(Qt6 REQUIRED COMPONENTS Test QuickTest)
+   find_package(Qt6 REQUIRED COMPONENTS Test QuickTest QuickControls2)
 
    add_subdirectory(autotests)
    add_subdirectory(tests)

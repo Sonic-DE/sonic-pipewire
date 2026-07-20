@@ -6,9 +6,13 @@
 
 #pragma once
 
+#include "portalfdutils.h"
+
 #include <QObject>
 #include <QDBusObjectPath>
 
+class OrgFreedesktopPortalScreenCastInterface;
+class QDBusError;
 class QTimer;
 class QQmlApplicationEngine;
 
@@ -49,6 +53,19 @@ public:
     void setDuration(int duration);
     void setPersistMode(PersistMode persistMode);
     void setRestoreToken(const QString &restoreToken);
+    int exitCode() const;
+
+Q_SIGNALS:
+    void failed(int exitCode);
+
+public:
+    void setDuplicateFdFunction(PortalDuplicateFdFunction duplicateFdFunction);
+    void startDurationTimerForTest();
+    bool durationTimerIsActiveForTest() const;
+
+    static uint selectCursorMode(uint availableCursorModes);
+    static bool validateCapabilities(uint availableSourceTypes, uint availableCursorModes, uint version, const QString& service, const QString& platform, const QString& desktop);
+    static bool validateStreams(const QList<Stream>& streams);
 
 public Q_SLOTS:
     void response(uint code, const QVariantMap &results);
@@ -57,6 +74,9 @@ private:
     void init(const QDBusObjectPath &path);
     void handleStreams(const QList<Stream> &streams);
     void start();
+    void closeSessionAndQuit();
+    void abortWithError(int exitCode);
+    bool logReplyError(const char* action, const QDBusError& error, const QDBusObjectPath& requestPath = {}, const QDBusObjectPath& sessionPath = {}) const;
 
     OrgFreedesktopPortalScreenCastInterface *iface;
     QDBusObjectPath m_path;
@@ -65,4 +85,7 @@ private:
     QQmlApplicationEngine* m_engine;
     PersistMode m_persistMode = NoPersist;
     QString m_restoreToken;
+    int m_exitCode = 0;
+    PortalDuplicateFdFunction m_duplicateFdFunction = portalDuplicateFd;
+    bool m_streamInstalled = false;
 };

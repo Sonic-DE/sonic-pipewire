@@ -14,7 +14,7 @@ int main(int argc, char **argv)
 
     {
         QCommandLineParser parser;
-        QCommandLineOption duration(QStringLiteral("duration"), QStringLiteral("seconds length of the video"), QStringLiteral("duration"));
+        QCommandLineOption duration(QStringLiteral("duration"), QStringLiteral("milliseconds length of the preview"), QStringLiteral("duration"));
         parser.addOption(duration);
 
         QCommandLineOption persistMode(QStringLiteral("persistMode"),
@@ -29,8 +29,11 @@ int main(int argc, char **argv)
         parser.process(app);
 
         RecordMe *me = new RecordMe(&app);
+        QObject::connect(me, &RecordMe::failed, &app, [&app](int exitCode) {
+            app.exit(exitCode);
+        });
         if (parser.isSet(duration)) {
-            me->setDuration(parser.value(duration).toInt() * 1000);
+            me->setDuration(parser.value(duration).toInt());
         }
         if (parser.isSet(persistMode)) {
             int rawPersitValue = parser.value(persistMode).toInt();
@@ -39,6 +42,9 @@ int main(int argc, char **argv)
         }
         if (parser.isSet(restoreToken)) {
             me->setRestoreToken(parser.value(restoreToken));
+        }
+        if (me->exitCode() != 0) {
+            return me->exitCode();
         }
     }
 

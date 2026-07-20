@@ -5,57 +5,161 @@
 */
 
 #include <KSignalHandler>
+
 #include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDBusArgument>
+#include <QDBusError>
+#include <QDBusObjectPath>
+#include <QDBusUnixFileDescriptor>
 #include <QDebug>
 #include <QGuiApplication>
-#include <QScreen>
+#include <QPointer>
+#include <QRandomGenerator>
+#include <QTimer>
 
-#include "screencasting.h"
+#include "headlessportalutils.h"
+#include "portalfdutils.h"
 #include "xdp_dbus_remotedesktop_interface.h"
 #include "xdp_dbus_screencast_interface.h"
+
 #include <DmaBufHandler>
 #include <PipeWireEncodedStream>
 #include <PipeWireSourceStream>
-#include <QDBusArgument>
-#include <unistd.h>
 
 using namespace Qt::StringLiterals;
 
-static bool s_encodedStream = false;
-static std::optional<Fraction> s_framerate;
-static std::optional<QByteArray> s_encoder;
-static Screencasting::CursorMode s_cursorMode = Screencasting::Embedded;
+namespace {
+bool s_encodedStream = false;
+std::optional<Fraction> s_framerate;
+std::optional<QByteArray> s_encoder;
+std::optional<uint> s_requestedCursorMode;
+std::optional<int> s_duration;
+QList<QPointer<PipeWireEncodedStream>> s_encodedStreams;
+QList<QPointer<PipeWireSourceStream>> s_sourceStreams;
+bool s_shutdownStarted = false;
 
-static QString createHandleToken()
+QString createHandleToken()
 {
     return QStringLiteral("kpipewireheadlesstest%1").arg(QRandomGenerator::global()->generate());
 }
 
-void createStream(int nodeId, std::optional<int> fd = {})
+void failHeadless(const QString& message, const QDBusError& error = {})
 {
+    if (error.isValid()) {
+        qWarning() << message << error.name() << error.message();
+    } else {
+        qWarning() << message;
+    }
+    QCoreApplication::exit(1);
+}
+
+bool connectPortalRequest(const QDBusObjectPath& requestPath, QObject* receiver, const char* slot, const QString& operation, const QDBusObjectPath& sessionPath = {})
+{
+    const bool connected = QDBusConnection::sessionBus().connect(QString(),
+        requestPath.path(),
+        QStringLiteral("org.freedesktop.portal.Request"),
+        QStringLiteral("Response"),
+        receiver,
+        slot);
+    if (!connected) {
+        qWarning() << "Failed to connect portal request response" << operation << "request" << requestPath.path() << "session" << sessionPath.path();
+    }
+    return connected;
+}
+
+bool streamsStillStopping()
+{
+    for (const auto& stream : std::as_const(s_encodedStreams)) {
+        if (stream && stream->state() != PipeWireEncodedStream::Idle) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void maybeQuitAfterShutdown()
+{
+    if (s_shutdownStarted && !streamsStillStopping()) {
+        QCoreApplication::quit();
+    }
+}
+
+void beginOrderlyShutdown()
+{
+    if (s_shutdownStarted) {
+        return;
+    }
+    s_shutdownStarted = true;
+
+    for (const auto& stream : std::as_const(s_encodedStreams)) {
+        if (stream && stream->state() != PipeWireEncodedStream::Idle) {
+            stream->stop();
+        }
+    }
+    for (const auto& stream : std::as_const(s_sourceStreams)) {
+        if (stream) {
+            stream->setActive(false);
+        }
+    }
+
+    QTimer::singleShot(5000, qGuiApp, [] {
+        qWarning() << "Timed out waiting for PipeWire streams to stop; quitting headless portal test";
+        QCoreApplication::quit();
+    });
+    maybeQuitAfterShutdown();
+}
+
+void startDurationTimerIfRequested()
+{
+    if (!s_duration || *s_duration <= 0) {
+        return;
+    }
+
+    auto timer = new QTimer(qGuiApp);
+    timer->setSingleShot(true);
+    QObject::connect(timer, &QTimer::timeout, qGuiApp, &beginOrderlyShutdown);
+    timer->start(*s_duration);
+    qInfo() << "Headless portal duration timer started" << *s_duration << "milliseconds";
+}
+
+PipeWireBaseEncodedStream::Encoder encoderFromOption(const QByteArray& encoderName)
+{
+    if (encoderName == QByteArray("H264Main")) {
+        return PipeWireBaseEncodedStream::H264Main;
+    }
+    if (encoderName == QByteArray("H264Baseline")) {
+        return PipeWireBaseEncodedStream::H264Baseline;
+    }
+    if (encoderName == QByteArray("VP8")) {
+        return PipeWireBaseEncodedStream::VP8;
+    }
+    if (encoderName == QByteArray("VP9")) {
+        return PipeWireBaseEncodedStream::VP9;
+    }
+    return PipeWireBaseEncodedStream::NoEncoder;
+}
+
+bool createPipeWireStream(uint nodeId, PortalUniqueFd fd = {})
+{
+    if (nodeId == 0) {
+        qWarning() << "Refusing to create a PipeWire stream for zero node id";
+        return false;
+    }
+
     if (s_encodedStream) {
         auto encoded = new PipeWireEncodedStream(qGuiApp);
         encoded->setNodeId(nodeId);
-        if (fd) {
-            encoded->setFd(*fd);
+        if (fd.isValid()) {
+            encoded->setFd(uint(fd.release()));
         }
         if (s_framerate) {
             encoded->setMaxFramerate(*s_framerate);
         }
         if (s_encoder) {
-            PipeWireBaseEncodedStream::Encoder enc = PipeWireBaseEncodedStream::NoEncoder;
-            if (s_encoder.value() == QByteArray("H264Main")) {
-                enc = PipeWireBaseEncodedStream::H264Main;
-            } else if (s_encoder.value() == QByteArray("H264Baseline")) {
-                enc = PipeWireBaseEncodedStream::H264Baseline;
-            } else if (s_encoder.value() == QByteArray("VP8")) {
-                enc = PipeWireBaseEncodedStream::VP8;
-            } else if (s_encoder.value() == QByteArray("VP9")) {
-                enc = PipeWireBaseEncodedStream::VP9;
-            }
-            encoded->setEncoder(enc);
+            encoded->setEncoder(encoderFromOption(*s_encoder));
         }
-        encoded->start();
+
         QObject::connect(encoded, &PipeWireEncodedStream::newPacket, qGuiApp, [](const PipeWireEncodedStream::Packet &packet) {
             qDebug() << "packet received" << packet.data().size() << "key:" << packet.isKeyFrame();
         });
@@ -65,30 +169,39 @@ void createStream(int nodeId, std::optional<int> fd = {})
         QObject::connect(encoded, &PipeWireEncodedStream::stateChanged, qGuiApp, [encoded]() {
             switch (encoded->state()) {
             case PipeWireEncodedStream::Recording:
-                qDebug() << "Started recording";
+                qDebug() << "Started headless portal encoding";
                 break;
             case PipeWireEncodedStream::Rendering:
-                qDebug() << "Stopped recording, flushing remaining frames";
+                qDebug() << "Stopped headless portal encoding, flushing remaining frames";
                 break;
             case PipeWireEncodedStream::Idle:
-                qDebug() << "Recording finished, quitting";
-                exit(0);
+                qDebug() << "Headless portal encoding idle";
+                maybeQuitAfterShutdown();
                 break;
             }
         });
-        QObject::connect(KSignalHandler::self(), &KSignalHandler::signalReceived, encoded, [encoded] {
-            encoded->stop();
+        QObject::connect(encoded, &PipeWireEncodedStream::errorFound, qGuiApp, [](const QString& error) {
+            qWarning() << "Headless portal encoded stream error" << error;
+            QCoreApplication::exit(1);
         });
-        return;
+
+        s_encodedStreams.push_back(encoded);
+        encoded->start();
+        return true;
     }
+
     auto pwStream = new PipeWireSourceStream(qGuiApp);
     pwStream->setAllowDmaBuf(false);
     if (s_framerate) {
         pwStream->setMaxFramerate(*s_framerate);
     }
-    if (!pwStream->createStream((uint)nodeId, 0)) {
-        qWarning() << "failed!" << pwStream->error();
-        exit(1);
+    if (!pwStream->createStream(nodeId, fd.isValid() ? fd.get() : 0)) {
+        qWarning() << "failed to create headless portal PipeWire stream" << nodeId << pwStream->error();
+        delete pwStream;
+        return false;
+    }
+    if (fd.isValid()) {
+        fd.release();
     }
 
     auto handler = std::make_shared<DmaBufHandler>();
@@ -107,48 +220,60 @@ void createStream(int nodeId, std::optional<int> fd = {})
             qDebug() << "no-frame";
         }
     });
-    QObject::connect(KSignalHandler::self(), &KSignalHandler::signalReceived, pwStream, [pwStream] {
-        pwStream->setActive(false);
+    QObject::connect(pwStream, &PipeWireSourceStream::stateChanged, qGuiApp, [](pw_stream_state state, pw_stream_state) {
+        if (state == PW_STREAM_STATE_UNCONNECTED) {
+            maybeQuitAfterShutdown();
+        }
     });
+
+    s_sourceStreams.push_back(pwStream);
+    return true;
 }
 
-void processStream(ScreencastingStream *stream)
+bool installPortalStreams(const HeadlessPortalStreams& streams, QDBusUnixFileDescriptor pipewireFd)
 {
-    QObject::connect(stream, &ScreencastingStream::created, qGuiApp, [](int nodeId) {
-        createStream(nodeId);
-    });
-}
-
-void checkPlasmaScreens()
-{
-    auto screencasting = new Screencasting(qGuiApp);
-    for (auto screen : qGuiApp->screens()) {
-        auto stream = screencasting->createOutputStream(screen->name(), s_cursorMode);
-        processStream(stream);
+    QString validationError;
+    if (!validateHeadlessPortalStreams(streams, &validationError)) {
+        qWarning() << "Invalid portal stream response" << validationError;
+        return false;
     }
-}
-
-void checkPlasmaWorkspace()
-{
-    auto screencasting = new Screencasting(qGuiApp);
-    QRegion region;
-    for (auto screen : qGuiApp->screens()) {
-        region |= screen->geometry();
+    if (!pipewireFd.isValid()) {
+        qWarning() << "Portal did not return a valid PipeWire remote descriptor";
+        return false;
     }
-    auto stream = screencasting->createRegionStream(region.boundingRect(), 1, s_cursorMode);
-    processStream(stream);
+
+    PortalUniqueFd originalFd(pipewireFd.takeFileDescriptor());
+    auto duplicatedFds = portalDuplicateFdForStreams(std::move(originalFd), streams.size(), portalDuplicateFd);
+    if (!duplicatedFds) {
+        qWarning() << "Could not duplicate PipeWire remote descriptor for headless portal streams" << streams.size();
+        return false;
+    }
+
+    for (qsizetype i = 0; i < streams.size(); ++i) {
+        const auto& stream = streams.at(i);
+        qInfo() << "Installing headless portal stream" << stream.nodeId << "optionKeys" << headlessPortalOptionKeys(stream.map);
+        if (!createPipeWireStream(stream.nodeId, std::move(duplicatedFds->at(static_cast<size_t>(i))))) {
+            return false;
+        }
+    }
+
+    startDurationTimerIfRequested();
+    return true;
+}
 }
 
-using Stream = struct {
-    uint nodeId;
-    QVariantMap map;
-};
-using Streams = QList<Stream>;
+Q_DECLARE_METATYPE(HeadlessPortalStream)
+Q_DECLARE_METATYPE(HeadlessPortalStreams)
 
-Q_DECLARE_METATYPE(Stream);
-Q_DECLARE_METATYPE(Streams);
+QDBusArgument& operator<<(QDBusArgument& arg, const HeadlessPortalStream& stream)
+{
+    arg.beginStructure();
+    arg << stream.nodeId << stream.map;
+    arg.endStructure();
+    return arg;
+}
 
-const QDBusArgument &operator>>(const QDBusArgument &arg, Stream &stream)
+const QDBusArgument& operator>>(const QDBusArgument& arg, HeadlessPortalStream& stream)
 {
     arg.beginStructure();
     arg >> stream.nodeId;
@@ -172,7 +297,7 @@ class XdpScreenCast : public QObject
 {
     Q_OBJECT
 public:
-    XdpScreenCast(QObject *parent)
+    explicit XdpScreenCast(QObject* parent)
         : QObject(parent)
     {
         initDbus();
@@ -180,135 +305,122 @@ public:
 
     void initDbus()
     {
-        dbusXdpScreenCastService.reset(new OrgFreedesktopPortalScreenCastInterface(QStringLiteral("org.freedesktop.portal.Desktop"),
-                                                                                   QStringLiteral("/org/freedesktop/portal/desktop"),
-                                                                                   QDBusConnection::sessionBus()));
+        m_screenCastInterface.reset(new OrgFreedesktopPortalScreenCastInterface(QStringLiteral("org.freedesktop.portal.Desktop"),
+            QStringLiteral("/org/freedesktop/portal/desktop"),
+            QDBusConnection::sessionBus()));
 
-        qInfo() << "Initializing D-Bus connectivity with XDG Desktop Portal" << dbusXdpScreenCastService->version();
-        Q_ASSERT(dbusXdpScreenCastService->isValid());
-
-        // create session
-        auto sessionParameters =
-            QVariantMap{{QStringLiteral("session_handle_token"), createHandleToken()}, {QStringLiteral("handle_token"), createHandleToken()}};
-        auto sessionReply = dbusXdpScreenCastService->CreateSession(sessionParameters);
-        sessionReply.waitForFinished();
-        if (!sessionReply.isValid()) {
-            qWarning() << "Couldn't initialize XDP-KDE screencast session" << sessionReply.error();
-            exit(1);
+        qInfo() << "Initializing headless D-Bus connectivity with XDG Desktop Portal"
+                << "service" << m_screenCastInterface->service() << "version" << m_screenCastInterface->version() << "sourceModes"
+                << m_screenCastInterface->availableSourceTypes() << "cursorModes" << m_screenCastInterface->availableCursorModes();
+        if (!m_screenCastInterface->isValid()) {
+            failHeadless(QStringLiteral("XDG ScreenCast portal interface is not valid"), m_screenCastInterface->lastError());
+            return;
+        }
+        if (m_screenCastInterface->availableSourceTypes() == 0) {
+            failHeadless(QStringLiteral("XDG ScreenCast portal advertises no source types"));
             return;
         }
 
-        qInfo() << "DBus session created: " << sessionReply.value().path()
-                << QDBusConnection::sessionBus().connect(QString(),
-                                                         sessionReply.value().path(),
-                                                         QStringLiteral("org.freedesktop.portal.Request"),
-                                                         QStringLiteral("Response"),
-                                                         this,
-                                                         SLOT(handleSessionCreated(uint, QVariantMap)));
+        auto sessionReply = m_screenCastInterface->CreateSession({{QStringLiteral("session_handle_token"), createHandleToken()},
+            {QStringLiteral("handle_token"), createHandleToken()}});
+        sessionReply.waitForFinished();
+        if (sessionReply.isError()) {
+            failHeadless(QStringLiteral("Could not initialize XDG ScreenCast session"), sessionReply.error());
+            return;
+        }
+
+        qInfo() << "D-Bus ScreenCast session request created" << sessionReply.value().path();
+        if (!connectPortalRequest(sessionReply.value(), this, SLOT(handleSessionCreated(uint, QVariantMap)), QStringLiteral("CreateSession"))) {
+            QCoreApplication::exit(1);
+        }
     }
 
 public Q_SLOTS:
     void handleSessionCreated(quint32 code, const QVariantMap &results)
     {
         if (code != 0) {
-            qWarning() << "Failed to create session: " << code;
-            exit(1);
+            qWarning() << "Failed to create ScreenCast session" << code << results;
+            QCoreApplication::exit(1);
             return;
         }
 
-        sessionPath = QDBusObjectPath(results.value(QStringLiteral("session_handle")).toString());
+        m_sessionPath = QDBusObjectPath(results.value(QStringLiteral("session_handle")).toString());
+        if (m_sessionPath.path().isEmpty()) {
+            qWarning() << "ScreenCast session response did not contain a session handle" << results;
+            QCoreApplication::exit(1);
+            return;
+        }
 
-        // select sources for the session
-        const QVariantMap sourcesParameters = {{QLatin1String("handle_token"), createHandleToken()},
-                                               {QLatin1String("types"), dbusXdpScreenCastService->availableSourceTypes()},
-                                               {QLatin1String("multiple"), false},
-                                               {QLatin1String("cursor_mode"), uint(2 /*Embedded*/)}};
-        auto selectorReply = dbusXdpScreenCastService->SelectSources(sessionPath, sourcesParameters);
+        QString cursorError;
+        const auto cursorMode = selectHeadlessPortalCursorMode(m_screenCastInterface->availableCursorModes(), s_requestedCursorMode, &cursorError);
+        if (!cursorMode) {
+            qWarning() << "Could not select ScreenCast cursor mode" << cursorError;
+            QCoreApplication::exit(1);
+            return;
+        }
+
+        auto sourcesParameters = buildHeadlessScreenCastSourceOptions(m_screenCastInterface->availableSourceTypes(), *cursorMode);
+        sourcesParameters.insert(QStringLiteral("handle_token"), createHandleToken());
+        auto selectorReply = m_screenCastInterface->SelectSources(m_sessionPath, sourcesParameters);
         selectorReply.waitForFinished();
-        if (!selectorReply.isValid()) {
-            qWarning() << "Couldn't select devices for the remote-desktop session";
-            exit(1);
+        if (selectorReply.isError()) {
+            failHeadless(QStringLiteral("Could not select ScreenCast sources for session %1").arg(m_sessionPath.path()), selectorReply.error());
             return;
         }
-        QDBusConnection::sessionBus().connect(QString(),
-                                              selectorReply.value().path(),
-                                              QStringLiteral("org.freedesktop.portal.Request"),
-                                              QStringLiteral("Response"),
-                                              this,
-                                              SLOT(handleSourcesSelected(uint, QVariantMap)));
+        if (!connectPortalRequest(selectorReply.value(), this, SLOT(handleSourcesSelected(uint, QVariantMap)), QStringLiteral("SelectSources"), m_sessionPath)) {
+            QCoreApplication::exit(1);
+        }
     }
 
-    void handleSourcesSelected(quint32 code, const QVariantMap &)
+    void handleSourcesSelected(quint32 code, const QVariantMap& results)
     {
         if (code != 0) {
-            qWarning() << "Failed to select sources: " << code;
-            exit(1);
+            qWarning() << "Failed to select ScreenCast sources" << code << results << "session" << m_sessionPath.path();
+            QCoreApplication::exit(1);
             return;
         }
 
-        // start session
-        auto startParameters = QVariantMap{{QStringLiteral("handle_token"), createHandleToken()}};
-        auto startReply = dbusXdpScreenCastService->Start(sessionPath, QString(), startParameters);
+        auto startReply = m_screenCastInterface->Start(m_sessionPath, QString(), {{QStringLiteral("handle_token"), createHandleToken()}});
         startReply.waitForFinished();
-        QDBusConnection::sessionBus().connect(QString(),
-                                              startReply.value().path(),
-                                              QStringLiteral("org.freedesktop.portal.Request"),
-                                              QStringLiteral("Response"),
-                                              this,
-                                              SLOT(handleRemoteDesktopStarted(uint, QVariantMap)));
+        if (startReply.isError()) {
+            failHeadless(QStringLiteral("Could not start ScreenCast session %1").arg(m_sessionPath.path()), startReply.error());
+            return;
+        }
+        if (!connectPortalRequest(startReply.value(), this, SLOT(handleStarted(uint, QVariantMap)), QStringLiteral("Start"), m_sessionPath)) {
+            QCoreApplication::exit(1);
+        }
     }
 
-    void handleRemoteDesktopStarted(quint32 code, const QVariantMap &results)
+    void handleStarted(quint32 code, const QVariantMap& results)
     {
         if (code != 0) {
-            qWarning() << "Failed to start screencast: " << code;
-            exit(1);
+            qWarning() << "Failed to start ScreenCast session" << code << results << "session" << m_sessionPath.path();
+            QCoreApplication::exit(1);
             return;
         }
 
-        // there should be only one stream
-        const Streams streams = qdbus_cast<Streams>(results.value(QStringLiteral("streams")));
-        if (streams.isEmpty()) {
-            // maybe we should check deeper with qdbus_cast but this suffices for now
-            qWarning() << "Failed to get screencast streams";
-            exit(1);
-            return;
-        }
-
-        const QVariantMap startParameters = {
-            { QLatin1String("handle_token"), createHandleToken() }
-        };
-
-        auto streamReply = dbusXdpScreenCastService->OpenPipeWireRemote(sessionPath, startParameters);
+        const HeadlessPortalStreams streams = qdbus_cast<HeadlessPortalStreams>(results.value(QStringLiteral("streams")));
+        auto streamReply = m_screenCastInterface->OpenPipeWireRemote(m_sessionPath, {{QStringLiteral("handle_token"), createHandleToken()}});
         streamReply.waitForFinished();
-        if (!streamReply.isValid()) {
-            qWarning() << "Couldn't open pipewire remote for the screen-casting session";
-            exit(1);
+        if (streamReply.isError()) {
+            failHeadless(QStringLiteral("Could not open PipeWire remote for ScreenCast session %1").arg(m_sessionPath.path()), streamReply.error());
             return;
         }
-
-        auto pipewireFd = streamReply.value();
-        if (!pipewireFd.isValid()) {
-            qWarning() << "Couldn't get pipewire connection file descriptor";
-            exit(1);
-            return;
-        }
-        const uint fd = pipewireFd.takeFileDescriptor();
-        for (auto x : streams) {
-            createStream(x.nodeId, fd);
+        if (!installPortalStreams(streams, streamReply.value())) {
+            QCoreApplication::exit(1);
         }
     }
 
 private:
-    QScopedPointer<OrgFreedesktopPortalScreenCastInterface> dbusXdpScreenCastService;
-    QDBusObjectPath sessionPath;
+    QScopedPointer<OrgFreedesktopPortalScreenCastInterface> m_screenCastInterface;
+    QDBusObjectPath m_sessionPath;
 };
 
 class XdpRemoteDesktop : public QObject
 {
     Q_OBJECT
 public:
-    XdpRemoteDesktop(QObject *parent)
+    explicit XdpRemoteDesktop(QObject* parent)
         : QObject(parent)
     {
         initDbus();
@@ -316,229 +428,238 @@ public:
 
     void initDbus()
     {
-        dbusXdpScreenCastService.reset(new OrgFreedesktopPortalScreenCastInterface(QStringLiteral("org.freedesktop.portal.Desktop"),
-                                                                                   QStringLiteral("/org/freedesktop/portal/desktop"),
-                                                                                   QDBusConnection::sessionBus()));
-        dbusXdpRemoteDesktopService.reset(new OrgFreedesktopPortalRemoteDesktopInterface(QStringLiteral("org.freedesktop.portal.Desktop"),
-                                                                                         QStringLiteral("/org/freedesktop/portal/desktop"),
-                                                                                         QDBusConnection::sessionBus()));
+        m_screenCastInterface.reset(new OrgFreedesktopPortalScreenCastInterface(QStringLiteral("org.freedesktop.portal.Desktop"),
+            QStringLiteral("/org/freedesktop/portal/desktop"),
+            QDBusConnection::sessionBus()));
+        m_remoteDesktopInterface.reset(new OrgFreedesktopPortalRemoteDesktopInterface(QStringLiteral("org.freedesktop.portal.Desktop"),
+            QStringLiteral("/org/freedesktop/portal/desktop"),
+            QDBusConnection::sessionBus()));
 
-        qInfo() << "Initializing D-Bus connectivity with XDG Desktop Portal" << dbusXdpScreenCastService->version();
-        Q_ASSERT(dbusXdpScreenCastService->isValid());
-        Q_ASSERT(dbusXdpRemoteDesktopService->isValid());
-
-        // create session
-        auto sessionParameters =
-            QVariantMap{{QStringLiteral("session_handle_token"), createHandleToken()}, {QStringLiteral("handle_token"), createHandleToken()}};
-        auto sessionReply = dbusXdpRemoteDesktopService->CreateSession(sessionParameters);
-        sessionReply.waitForFinished();
-        if (!sessionReply.isValid()) {
-            qWarning() << "Couldn't initialize XDP-KDE screencast session" << sessionReply.error();
-            exit(1);
+        qInfo() << "Initializing headless RemoteDesktop D-Bus connectivity with XDG Desktop Portal"
+                << "service" << m_remoteDesktopInterface->service() << "version" << m_remoteDesktopInterface->version() << "sourceModes"
+                << m_screenCastInterface->availableSourceTypes() << "cursorModes" << m_screenCastInterface->availableCursorModes();
+        if (!m_screenCastInterface->isValid()) {
+            failHeadless(QStringLiteral("XDG ScreenCast portal interface is not valid"), m_screenCastInterface->lastError());
+            return;
+        }
+        if (!m_remoteDesktopInterface->isValid()) {
+            failHeadless(QStringLiteral("XDG RemoteDesktop portal interface is not valid"), m_remoteDesktopInterface->lastError());
+            return;
+        }
+        if (m_screenCastInterface->availableSourceTypes() == 0) {
+            failHeadless(QStringLiteral("XDG ScreenCast portal advertises no source types"));
             return;
         }
 
-        qInfo() << "DBus session created: " << sessionReply.value().path()
-                << QDBusConnection::sessionBus().connect(QString(),
-                                                         sessionReply.value().path(),
-                                                         QStringLiteral("org.freedesktop.portal.Request"),
-                                                         QStringLiteral("Response"),
-                                                         this,
-                                                         SLOT(handleSessionCreated(uint, QVariantMap)));
+        auto sessionReply = m_remoteDesktopInterface->CreateSession({{QStringLiteral("session_handle_token"), createHandleToken()},
+            {QStringLiteral("handle_token"), createHandleToken()}});
+        sessionReply.waitForFinished();
+        if (sessionReply.isError()) {
+            failHeadless(QStringLiteral("Could not initialize XDG RemoteDesktop session"), sessionReply.error());
+            return;
+        }
+
+        qInfo() << "D-Bus RemoteDesktop session request created" << sessionReply.value().path();
+        if (!connectPortalRequest(sessionReply.value(), this, SLOT(handleSessionCreated(uint, QVariantMap)), QStringLiteral("CreateSession"))) {
+            QCoreApplication::exit(1);
+        }
     }
 
 public Q_SLOTS:
     void handleSessionCreated(quint32 code, const QVariantMap &results)
     {
         if (code != 0) {
-            qWarning() << "Failed to create session: " << code;
-            exit(1);
+            qWarning() << "Failed to create RemoteDesktop session" << code << results;
+            QCoreApplication::exit(1);
             return;
         }
 
-        sessionPath = QDBusObjectPath(results.value(QStringLiteral("session_handle")).toString());
+        m_sessionPath = QDBusObjectPath(results.value(QStringLiteral("session_handle")).toString());
+        if (m_sessionPath.path().isEmpty()) {
+            qWarning() << "RemoteDesktop session response did not contain a session handle" << results;
+            QCoreApplication::exit(1);
+            return;
+        }
 
-        // select sources for the session
-        auto selectionOptions = QVariantMap{// We have to specify it's an uint, otherwise xdg-desktop-portal will not forward it to backend implementation
-                                            {QStringLiteral("types"), QVariant::fromValue<uint>(7)}, // request all (KeyBoard, Pointer, TouchScreen)
-                                            {QStringLiteral("handle_token"), createHandleToken()}};
-        auto selectorReply = dbusXdpRemoteDesktopService->SelectDevices(sessionPath, selectionOptions);
+        auto selectionOptions = buildHeadlessRemoteDesktopDeviceOptions();
+        selectionOptions.insert(QStringLiteral("handle_token"), createHandleToken());
+        auto selectorReply = m_remoteDesktopInterface->SelectDevices(m_sessionPath, selectionOptions);
         selectorReply.waitForFinished();
-        if (!selectorReply.isValid()) {
-            qWarning() << "Couldn't select devices for the remote-desktop session";
-            exit(1);
+        if (selectorReply.isError()) {
+            failHeadless(QStringLiteral("Could not select RemoteDesktop devices for session %1").arg(m_sessionPath.path()), selectorReply.error());
             return;
         }
-        QDBusConnection::sessionBus().connect(QString(),
-                                              selectorReply.value().path(),
-                                              QStringLiteral("org.freedesktop.portal.Request"),
-                                              QStringLiteral("Response"),
-                                              this,
-                                              SLOT(handleDevicesSelected(uint, QVariantMap)));
+        if (!connectPortalRequest(selectorReply.value(), this, SLOT(handleDevicesSelected(uint, QVariantMap)), QStringLiteral("SelectDevices"), m_sessionPath)) {
+            QCoreApplication::exit(1);
+        }
     }
 
     void handleDevicesSelected(quint32 code, const QVariantMap &results)
     {
-        Q_UNUSED(results)
         if (code != 0) {
-            qWarning() << "Failed to select devices: " << code;
-            exit(1);
+            qWarning() << "Failed to select RemoteDesktop devices" << code << results << "session" << m_sessionPath.path();
+            QCoreApplication::exit(1);
             return;
         }
 
-        // select sources for the session
-        auto selectionOptions = QVariantMap{{QStringLiteral("types"), QVariant::fromValue<uint>(7)},
-                                            {QStringLiteral("multiple"), false},
-                                            {QStringLiteral("handle_token"), createHandleToken()}};
-        auto selectorReply = dbusXdpScreenCastService->SelectSources(sessionPath, selectionOptions);
-        selectorReply.waitForFinished();
-        if (!selectorReply.isValid()) {
-            qWarning() << "Couldn't select sources for the screen-casting session";
-            exit(1);
+        QString cursorError;
+        const auto cursorMode = selectHeadlessPortalCursorMode(m_screenCastInterface->availableCursorModes(), s_requestedCursorMode, &cursorError);
+        if (!cursorMode) {
+            qWarning() << "Could not select RemoteDesktop ScreenCast cursor mode" << cursorError;
+            QCoreApplication::exit(1);
             return;
         }
-        QDBusConnection::sessionBus().connect(QString(),
-                                              selectorReply.value().path(),
-                                              QStringLiteral("org.freedesktop.portal.Request"),
-                                              QStringLiteral("Response"),
-                                              this,
-                                              SLOT(handleSourcesSelected(uint, QVariantMap)));
+
+        auto selectionOptions = buildHeadlessScreenCastSourceOptions(m_screenCastInterface->availableSourceTypes(), *cursorMode);
+        selectionOptions.insert(QStringLiteral("handle_token"), createHandleToken());
+        auto selectorReply = m_screenCastInterface->SelectSources(m_sessionPath, selectionOptions);
+        selectorReply.waitForFinished();
+        if (selectorReply.isError()) {
+            failHeadless(QStringLiteral("Could not select ScreenCast sources for RemoteDesktop session %1").arg(m_sessionPath.path()), selectorReply.error());
+            return;
+        }
+        if (!connectPortalRequest(selectorReply.value(), this, SLOT(handleSourcesSelected(uint, QVariantMap)), QStringLiteral("SelectSources"), m_sessionPath)) {
+            QCoreApplication::exit(1);
+        }
     }
 
-    void handleSourcesSelected(quint32 code, const QVariantMap &)
+    void handleSourcesSelected(quint32 code, const QVariantMap& results)
     {
         if (code != 0) {
-            qWarning() << "Failed to select sources: " << code;
-            exit(1);
+            qWarning() << "Failed to select RemoteDesktop ScreenCast sources" << code << results << "session" << m_sessionPath.path();
+            QCoreApplication::exit(1);
             return;
         }
 
-        // start session
-        auto startParameters = QVariantMap{{QStringLiteral("handle_token"), createHandleToken()}};
-        auto startReply = dbusXdpRemoteDesktopService->Start(sessionPath, QString(), startParameters);
+        auto startReply = m_remoteDesktopInterface->Start(m_sessionPath, QString(), {{QStringLiteral("handle_token"), createHandleToken()}});
         startReply.waitForFinished();
-        QDBusConnection::sessionBus().connect(QString(),
-                                              startReply.value().path(),
-                                              QStringLiteral("org.freedesktop.portal.Request"),
-                                              QStringLiteral("Response"),
-                                              this,
-                                              SLOT(handleRemoteDesktopStarted(uint, QVariantMap)));
+        if (startReply.isError()) {
+            failHeadless(QStringLiteral("Could not start RemoteDesktop session %1").arg(m_sessionPath.path()), startReply.error());
+            return;
+        }
+        if (!connectPortalRequest(startReply.value(), this, SLOT(handleRemoteDesktopStarted(uint, QVariantMap)), QStringLiteral("Start"), m_sessionPath)) {
+            QCoreApplication::exit(1);
+        }
     }
 
     void handleRemoteDesktopStarted(quint32 code, const QVariantMap &results)
     {
         if (code != 0) {
-            qWarning() << "Failed to start screencast: " << code;
-            exit(1);
+            qWarning() << "Failed to start RemoteDesktop session" << code << results << "session" << m_sessionPath.path();
+            QCoreApplication::exit(1);
             return;
         }
 
         if (results.value(QStringLiteral("devices")).toUInt() == 0) {
-            qWarning() << "No devices were granted" << results;
-            exit(1);
+            qWarning() << "No RemoteDesktop devices were granted" << results << "session" << m_sessionPath.path();
+            QCoreApplication::exit(1);
             return;
         }
 
-        // there should be only one stream
-        const Streams streams = qdbus_cast<Streams>(results.value(QStringLiteral("streams")));
-        if (streams.isEmpty()) {
-            // maybe we should check deeper with qdbus_cast but this suffices for now
-            qWarning() << "Failed to get screencast streams";
-            exit(1);
-            return;
-        }
-
-        auto streamReply = dbusXdpScreenCastService->OpenPipeWireRemote(sessionPath, QVariantMap());
+        const HeadlessPortalStreams streams = qdbus_cast<HeadlessPortalStreams>(results.value(QStringLiteral("streams")));
+        auto streamReply = m_screenCastInterface->OpenPipeWireRemote(m_sessionPath, {{QStringLiteral("handle_token"), createHandleToken()}});
         streamReply.waitForFinished();
-        if (!streamReply.isValid()) {
-            qWarning() << "Couldn't open pipewire remote for the screen-casting session";
-            exit(1);
+        if (streamReply.isError()) {
+            failHeadless(QStringLiteral("Could not open PipeWire remote for RemoteDesktop session %1").arg(m_sessionPath.path()), streamReply.error());
             return;
         }
-
-        auto pipewireFd = streamReply.value();
-        if (!pipewireFd.isValid()) {
-            qWarning() << "Couldn't get pipewire connection file descriptor";
-            exit(1);
-            return;
-        }
-
-        const uint fd = pipewireFd.takeFileDescriptor();
-        for (auto x : streams) {
-            createStream(x.nodeId, fd);
+        if (!installPortalStreams(streams, streamReply.value())) {
+            QCoreApplication::exit(1);
         }
     }
 
 private:
-    QScopedPointer<OrgFreedesktopPortalScreenCastInterface> dbusXdpScreenCastService;
-    QScopedPointer<OrgFreedesktopPortalRemoteDesktopInterface> dbusXdpRemoteDesktopService;
-    QDBusObjectPath sessionPath;
+    QScopedPointer<OrgFreedesktopPortalScreenCastInterface> m_screenCastInterface;
+    QScopedPointer<OrgFreedesktopPortalRemoteDesktopInterface> m_remoteDesktopInterface;
+    QDBusObjectPath m_sessionPath;
 };
 
 int main(int argc, char **argv)
 {
     QGuiApplication app(argc, argv);
 
-    {
-        QCommandLineParser parser;
-        const QMap<QString, Screencasting::CursorMode> cursorOptions = {
-            {QStringLiteral("hidden"), Screencasting::CursorMode::Hidden},
-            {QStringLiteral("embedded"), Screencasting::CursorMode::Embedded},
-            {QStringLiteral("metadata"), Screencasting::CursorMode::Metadata},
-        };
+    qDBusRegisterMetaType<HeadlessPortalStream>();
+    qDBusRegisterMetaType<HeadlessPortalStreams>();
 
-        QCommandLineOption cursorOption(QStringLiteral("cursor"),
-                                        QStringList(cursorOptions.keys()).join(QStringLiteral(", ")),
-                                        QStringLiteral("mode"),
-                                        QStringLiteral("metadata"));
+    QCommandLineParser parser;
+    QCommandLineOption useXdpRD(QStringLiteral("xdp-remotedesktop"), QStringLiteral("Uses the XDG Desktop Portal RemoteDesktop interface"));
+    parser.addOption(useXdpRD);
+    QCommandLineOption useXdpSC(QStringLiteral("xdp-screencast"), QStringLiteral("Uses the XDG Desktop Portal ScreenCast interface"));
+    parser.addOption(useXdpSC);
+    QCommandLineOption encodedStream(QStringLiteral("encoded"), QStringLiteral("Reports encoded streams with PipeWireEncodedStream"));
+    parser.addOption(encodedStream);
+    QCommandLineOption streamEncoder(QStringLiteral("encoder"),
+        QStringLiteral("Which encoding to use with PipeWireEncodedStream"),
+        u"encoding"_s,
+        u"libvpx"_s);
+    parser.addOption(streamEncoder);
+    QCommandLineOption streamFramerate(QStringLiteral("framerate"),
+        QStringLiteral("Makes sure a framerate is requested (format 30/1 would mean 30fps)"),
+        QStringLiteral("num/denom"));
+    parser.addOption(streamFramerate);
+    QCommandLineOption cursorOption(QStringLiteral("cursor"),
+        QStringLiteral("Portal cursor mode: hidden, embedded, metadata"),
+        QStringLiteral("mode"));
+    parser.addOption(cursorOption);
+    QCommandLineOption durationOption(QStringLiteral("duration"), QStringLiteral("milliseconds length of the headless portal run"), QStringLiteral("milliseconds"));
+    parser.addOption(durationOption);
+    parser.addPositionalArgument(QStringLiteral("node"), QStringLiteral("Raw PipeWire node id to consume without portal acquisition"), QStringLiteral("[node]"));
+    parser.addHelpOption();
+    parser.process(app);
 
-        KSignalHandler::self()->watchSignal(SIGTERM);
-        KSignalHandler::self()->watchSignal(SIGINT);
+    KSignalHandler::self()->watchSignal(SIGTERM);
+    KSignalHandler::self()->watchSignal(SIGINT);
+    QObject::connect(KSignalHandler::self(), &KSignalHandler::signalReceived, qGuiApp, &beginOrderlyShutdown);
 
-        QCommandLineOption useXdpRD(QStringLiteral("xdp-remotedesktop"), QStringLiteral("Uses the XDG Desktop Portal RemoteDesktop interface"));
-        parser.addOption(useXdpRD);
-        QCommandLineOption useXdpSC(QStringLiteral("xdp-screencast"), QStringLiteral("Uses the XDG Desktop Portal ScreenCast interface"));
-        parser.addOption(useXdpSC);
-        QCommandLineOption useWorkspace(QStringLiteral("workspace"), QStringLiteral("Uses the Plasma screencasting workspace feed"));
-        parser.addOption(useWorkspace);
-        QCommandLineOption encodedStream(QStringLiteral("encoded"), QStringLiteral("Reports encoded streams with PipeWireEncodedStream"));
-        parser.addOption(encodedStream);
-        QCommandLineOption streamEncoder(QStringLiteral("encoder"),
-                                         QStringLiteral("Which encoding to use with PipeWireEncodedStream"),
-                                         u"encoding"_s,
-                                         u"libvpx"_s);
-        parser.addOption(streamEncoder);
-        QCommandLineOption streamFramerate(QStringLiteral("framerate"),
-                                           QStringLiteral("Makes sure a framerate is requested (format 30/1 would mean 30fps)"),
-                                           QStringLiteral("num/denom"));
-        parser.addOption(streamFramerate);
-        parser.addOption(cursorOption);
-        parser.addHelpOption();
-        parser.process(app);
-
-        s_cursorMode = cursorOptions[parser.value(cursorOption).toLower()];
-        s_encodedStream = parser.isSet(encodedStream);
-        if (parser.isSet(streamEncoder)) {
-            s_encoder = parser.value(streamEncoder).toUtf8();
+    if (parser.isSet(cursorOption)) {
+        s_requestedCursorMode = headlessPortalCursorModeFromString(parser.value(cursorOption));
+        if (!s_requestedCursorMode) {
+            qWarning() << "Unsupported cursor mode" << parser.value(cursorOption);
+            return 1;
         }
-        if (parser.isSet(streamFramerate)) {
-            const auto framerateString = parser.value(streamFramerate).split(u'/');
-            if (framerateString.count() != 2) {
-                qWarning() << "wrong framerate" << framerateString;
-                return 1;
-            }
-            s_framerate = {framerateString.constFirst().toUInt(), framerateString.constLast().toUInt()};
+    }
+    s_encodedStream = parser.isSet(encodedStream);
+    if (parser.isSet(streamEncoder)) {
+        s_encoder = parser.value(streamEncoder).toUtf8();
+    }
+    if (parser.isSet(streamFramerate)) {
+        const auto framerateString = parser.value(streamFramerate).split(u'/');
+        if (framerateString.count() != 2) {
+            qWarning() << "wrong framerate" << framerateString;
+            return 1;
         }
+        s_framerate = {framerateString.constFirst().toUInt(), framerateString.constLast().toUInt()};
+    }
+    if (parser.isSet(durationOption)) {
+        bool ok = false;
+        const int duration = parser.value(durationOption).toInt(&ok);
+        if (!ok || duration <= 0) {
+            qWarning() << "invalid duration" << parser.value(durationOption);
+            return 1;
+        }
+        s_duration = duration;
+    }
 
-        if (parser.isSet(useXdpRD)) {
-            new XdpRemoteDesktop(&app);
-        } else if (parser.isSet(useXdpSC)) {
-            new XdpScreenCast(&app);
-        } else if (parser.isSet(useWorkspace)) {
-            checkPlasmaWorkspace();
-        } else {
-            checkPlasmaScreens();
+    const auto positionalArguments = parser.positionalArguments();
+    if (!positionalArguments.isEmpty()) {
+        if (positionalArguments.size() != 1 || parser.isSet(useXdpRD) || parser.isSet(useXdpSC)) {
+            qWarning() << "Raw node mode accepts exactly one node id and no portal mode option";
+            return 1;
         }
+        bool ok = false;
+        const uint nodeId = positionalArguments.constFirst().toUInt(&ok);
+        if (!ok || nodeId == 0) {
+            qWarning() << "invalid raw PipeWire node id" << positionalArguments.constFirst();
+            return 1;
+        }
+        if (!createPipeWireStream(nodeId)) {
+            return 1;
+        }
+        startDurationTimerIfRequested();
+    } else if (parser.isSet(useXdpRD)) {
+        new XdpRemoteDesktop(&app);
+    } else {
+        new XdpScreenCast(&app);
     }
 
     return app.exec();

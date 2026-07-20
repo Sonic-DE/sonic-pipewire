@@ -5,94 +5,90 @@
 */
 
 import QtQuick
-import QtQuick.Layouts
 import QtQuick.Controls
-import org.kde.kirigami as Kirigami
-import org.kde.taskmanager
-
+import QtQuick.Layouts
 import org.kde.pipewire as PipeWire
 
-Kirigami.ApplicationWindow
-{
+ApplicationWindow {
     id: root
-    width: 500
-    height: 500
+    title: "PipeWire Portal Preview"
+    width: 800
+    height: 600
     visible: true
     property QtObject app
 
     function addStream(nodeid, displayText, fd, allowDmaBuf) {
-        if (fd == null)
-            fd = 0;
-        rep.model.append({nodeId: nodeid, uuid: "", display: displayText, fd: fd, allowDmaBuf: allowDmaBuf })
+        streams.append({nodeId: nodeid, display: displayText, fd: fd, allowDmaBuf: allowDmaBuf})
     }
+
     function removeStream(nodeid) {
-        for(var i=0; i<rep.model.count; ++i) {
-            if (rep.model.get(i).nodeId === nodeid) {
-               rep.model.remove(i)
+        for (var i = 0; i < streams.count; ++i) {
+            if (streams.get(i).nodeId === nodeid) {
+                streams.remove(i)
                 break;
             }
         }
     }
 
-    Instantiator {
-        model: TasksModel {
-            groupMode: TasksModel.GroupDisabled
-        }
-        delegate: Item {
-            property var uuid: model.WinIdList
-            property var appId: model.AppId
-        }
-        onObjectAdded: (index, object) => {
-           app.addWindow(object.uuid, object.appId)
-        }
+    ListModel {
+        id: streams
     }
 
     ColumnLayout {
-        id: pipes
         anchors.fill: parent
+        anchors.margins: 12
+        spacing: 12
 
-        Button {
-            text: "Add Virtual Monitor"
-            onClicked: app.createVirtualMonitor()
-        }
-
-        Button {
-            text: "Add Region"
-            onClicked: app.requestSelection()
+        Label {
+            Layout.fillWidth: true
+            text: "Portal Preview"
+            font.pixelSize: 20
         }
 
         ListView {
             id: rep
-
             Layout.fillWidth: true
             Layout.fillHeight: true
-
             clip: true
-            model: ListModel {}
-            delegate: RowLayout {
-                Kirigami.Icon {
-                    source: sourceItem.usingDmaBuf ? "speedometer" : "delete"
-                }
+            spacing: 12
+            model: streams
 
-                Button {
-                    text: sourceItem.visible ? "Pause" : "Resume"
-                    icon.name: sourceItem.visible ? "media-playback-pause" : "media-playback-start"
-                    onClicked: sourceItem.visible = !sourceItem.visible;
-                }
+            delegate: Frame {
+                id: streamDelegate
+                required property var nodeId
+                required property string display
+                required property var fd
+                required property bool allowDmaBuf
+                width: ListView.view.width
 
-                Label {
-                    text: model.display
-                }
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    spacing: 8
 
-                PipeWire.PipeWireSourceItem {
-                    id: sourceItem
+                    RowLayout {
+                        Layout.fillWidth: true
 
-                    Layout.preferredWidth: Kirigami.Units.gridUnit * 16
-                    Layout.preferredHeight: Kirigami.Units.gridUnit * 8
+                        Label {
+                            Layout.fillWidth: true
+                            text: streamDelegate.display
+                            elide: Text.ElideRight
+                        }
 
-                    nodeId: model.nodeId
-                    fd: model.fd
-                    allowDmaBuf: model.allowDmaBuf
+                        Button {
+                            text: sourceItem.visible ? "Pause Preview" : "Resume Preview"
+                            onClicked: sourceItem.visible = !sourceItem.visible
+                        }
+                    }
+
+                    PipeWire.PipeWireSourceItem {
+                        id: sourceItem
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 320
+                        nodeId: streamDelegate.nodeId
+                        fd: streamDelegate.fd
+                        allowDmaBuf: streamDelegate.allowDmaBuf
+                    }
                 }
             }
         }

@@ -10,6 +10,7 @@
 #include "glhelpers.h"
 #include "logging.h"
 #include "pipewirecore_p.h"
+#include "pipewireframeutils_p.h"
 #include "pwhelpers.h"
 #include "rendernodecontext_p.h"
 #include "vaapiutils_p.h"
@@ -17,7 +18,6 @@
 #include <libdrm/drm_fourcc.h>
 #include <spa/utils/result.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 #include <QOpenGLTexture>
@@ -380,14 +380,17 @@ static void onProcess(void *data)
     stream->process();
 }
 
-PipeWireFrameData::PipeWireFrameData(spa_video_format format, void *data, QSize size, qint32 stride, PipeWireFrameCleanupFunction *cleanup)
+PipeWireFrameData::PipeWireFrameData(spa_video_format format, void* data, QSize size, qint32 stride, PipeWireFrameCleanupFunction* cleanup)
     : format(format)
     , data(data)
     , size(size)
     , stride(stride)
-    , cleanup(cleanup)
+    , cleanup(cleanup ? cleanup : new PipeWireFrameCleanupFunction([] { }))
 {
-    cleanup->ref();
+    if (!cleanup) {
+        qCWarning(PIPEWIRE_LOGGING) << "PipeWireFrameData constructed without cleanup; installing no-op cleanup";
+    }
+    this->cleanup->ref();
 }
 
 PipeWireFrameData::~PipeWireFrameData()
@@ -586,7 +589,14 @@ bool PipeWireSourceStream::createStream(quint64 objectSerial, int fd)
 
 void PipeWireSourceStream::handleFrame(struct pw_buffer *buffer)
 {
+    const auto view = PipeWireFrameUtils::validateVideoBuffer(buffer, d->videoFormat);
+    if (!view) {
+        return;
+    }
+
     spa_buffer *spaBuffer = buffer->buffer;
+    spa_data* data = view->data;
+    spa_chunk* chunk = view->chunk;
 
     PipeWireFrame frame;
     frame.format = d->videoFormat.format;
@@ -615,56 +625,24 @@ void PipeWireSourceStream::handleFrame(struct pw_buffer *buffer)
         }
     }
 
-    { // process cursor
-        struct spa_meta_cursor *cursor = static_cast<struct spa_meta_cursor *>(spa_buffer_find_meta_data(spaBuffer, SPA_META_Cursor, sizeof(*cursor)));
-        if (cursor && spa_meta_cursor_is_valid(cursor)) {
-            struct spa_meta_bitmap *bitmap = nullptr;
-
-            if (cursor->bitmap_offset)
-                bitmap = SPA_MEMBER(cursor, cursor->bitmap_offset, struct spa_meta_bitmap);
-
-            QImage cursorTexture;
-            if (bitmap && bitmap->size.width > 0 && bitmap->size.height > 0) {
-                const size_t bufferSize = bitmap->stride * bitmap->size.height * 4;
-                void *bufferData = malloc(bufferSize);
-                memcpy(bufferData, SPA_MEMBER(bitmap, bitmap->offset, uint8_t), bufferSize);
-                cursorTexture = PWHelpers::SpaBufferToQImage(static_cast<const uchar *>(bufferData),
-                                                             bitmap->size.width,
-                                                             bitmap->size.height,
-                                                             bitmap->stride,
-                                                             spa_video_format(bitmap->format),
-                                                             new PipeWireFrameCleanupFunction([bufferData] {
-                                                                 free(bufferData);
-                                                             }));
-            }
-            frame.cursor = {{cursor->position.x, cursor->position.y}, {cursor->hotspot.x, cursor->hotspot.y}, cursorTexture};
-        }
+    if (auto cursor = PipeWireFrameUtils::copyCursor(spaBuffer)) {
+        frame.cursor = std::move(cursor);
     }
 
-    if (spaBuffer->datas->chunk->flags == SPA_CHUNK_FLAG_CORRUPTED) {
+    if (chunk->flags == SPA_CHUNK_FLAG_CORRUPTED) {
         // do not get a frame
-        qCDebug(PIPEWIRE_LOGGING) << "skipping empty buffer" << spaBuffer->datas->chunk->size << spaBuffer->datas->chunk->flags;
-    } else if (spaBuffer->datas->type == SPA_DATA_MemFd) {
-        if (spaBuffer->datas->chunk->size == 0) {
+        qCDebug(PIPEWIRE_LOGGING) << "skipping empty buffer" << chunk->size << chunk->flags;
+    } else if (data->type == SPA_DATA_MemFd) {
+        if (chunk->size == 0) {
             qCDebug(PIPEWIRE_LOGGING) << "skipping empty memfd buffer";
-        } else {
-            const uint32_t mapEnd = spaBuffer->datas->maxsize + spaBuffer->datas->mapoffset;
-            uint8_t *map = static_cast<uint8_t *>(mmap(nullptr, mapEnd, PROT_READ, MAP_PRIVATE, spaBuffer->datas->fd, 0));
-
-            if (map == MAP_FAILED) {
-                qCWarning(PIPEWIRE_LOGGING) << "Failed to mmap the memory: " << strerror(errno);
-                return;
-            }
-            auto cleanup = [map, mapEnd]() {
-                munmap(map, mapEnd);
-            };
+        } else if (auto mapped = PipeWireFrameUtils::mapMemFdFrame(d->videoFormat.format, *view)) {
             frame.dataFrame = std::make_shared<PipeWireFrameData>(d->videoFormat.format,
-                                                                  map,
-                                                                  QSize(d->videoFormat.size.width, d->videoFormat.size.height),
-                                                                  spaBuffer->datas->chunk->stride,
-                                                                  new PipeWireFrameCleanupFunction(cleanup));
+                mapped->data,
+                mapped->size,
+                mapped->stride,
+                mapped->cleanup);
         }
-    } else if (spaBuffer->datas->type == SPA_DATA_DmaBuf) {
+    } else if (data->type == SPA_DATA_DmaBuf) {
         DmaBufAttributes attribs;
         attribs.planes.reserve(spaBuffer->n_datas);
         attribs.format = spaVideoFormatToDrmFormat(d->videoFormat.format);
@@ -683,21 +661,21 @@ void PipeWireSourceStream::handleFrame(struct pw_buffer *buffer)
         }
         Q_ASSERT(!attribs.planes.isEmpty());
         frame.dmabuf = attribs;
-    } else if (spaBuffer->datas->type == SPA_DATA_MemPtr) {
-        if (spaBuffer->datas->chunk->size == 0) {
+    } else if (data->type == SPA_DATA_MemPtr) {
+        if (chunk->size == 0) {
             qCDebug(PIPEWIRE_LOGGING) << "skipping empty memptr buffer";
-        } else {
+        } else if (auto copied = PipeWireFrameUtils::copyMemPtrFrame(d->videoFormat.format, *view)) {
             frame.dataFrame = std::make_shared<PipeWireFrameData>(d->videoFormat.format,
-                                                                  spaBuffer->datas->data,
-                                                                  QSize(d->videoFormat.size.width, d->videoFormat.size.height),
-                                                                  spaBuffer->datas->chunk->stride,
-                                                                  nullptr);
+                copied->data,
+                copied->size,
+                copied->stride,
+                copied->cleanup);
         }
     } else {
-        if (spaBuffer->datas->type == SPA_ID_INVALID) {
+        if (data->type == SPA_ID_INVALID) {
             qCWarning(PIPEWIRE_LOGGING) << "invalid buffer type";
         } else {
-            qCWarning(PIPEWIRE_LOGGING) << "unsupported buffer type" << spaBuffer->datas->type;
+            qCWarning(PIPEWIRE_LOGGING) << "unsupported buffer type" << data->type;
         }
         frame.dataFrame = {};
     }

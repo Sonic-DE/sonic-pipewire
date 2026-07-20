@@ -1,54 +1,38 @@
-find_package(Qt6 REQUIRED COMPONENTS WaylandClient)
-find_package(Wayland REQUIRED COMPONENTS Client)
-
-add_library(PipeWireScreencastingTest STATIC screencasting.cpp screencastingrequest.cpp)
-
 qt_add_dbus_interface(
-   SRCS
+   HEADLESS_XDP_SRCS
    org.freedesktop.portal.ScreenCast.xml
    xdp_dbus_screencast_interface
 )
 
 qt_add_dbus_interface(
-   SRCS
+   HEADLESS_XDP_SRCS
    org.freedesktop.portal.RemoteDesktop.xml
    xdp_dbus_remotedesktop_interface
 )
 
-qt6_generate_wayland_protocol_client_sources(PipeWireScreencastingTest
-    PRIVATE_CODE
-    FILES
-        ${PLASMA_WAYLAND_PROTOCOLS_DIR}/zkde-screencast-unstable-v1.xml
-)
-
-target_link_libraries(PipeWireScreencastingTest PUBLIC Wayland::Client Qt::DBus Qt::GuiPrivate KPipeWire Qt::WaylandClient)
-
-add_executable(recordme main.cpp recordme.qrc PlasmaRecordMe.cpp)
-target_link_libraries(recordme PipeWireScreencastingTest Qt::Quick)
-
-add_executable(kpipewireheadlesstest HeadlessTest.cpp ${SRCS})
-target_link_libraries(kpipewireheadlesstest PipeWireScreencastingTest KPipeWireDmaBuf KPipeWireRecord KF6::CoreAddons)
+add_executable(kpipewireheadlesstest HeadlessTest.cpp headlessportalutils.cpp portalfdutils.cpp ${HEADLESS_XDP_SRCS})
+target_link_libraries(kpipewireheadlesstest Qt::DBus Qt::Gui KPipeWire KPipeWireDmaBuf KPipeWireRecord KF6::CoreAddons)
 
 #########
 
 qt_add_dbus_interface(
-   XDP_SRCS
+   XDP_RECORDME_SRCS
    org.freedesktop.portal.ScreenCast.xml
    xdp_dbus_screencast_interface
 )
 
-add_executable(xdp-recordme xdp-main.cpp recordme.qrc ${XDP_SRCS} RecordMe.cpp)
-target_link_libraries(xdp-recordme Qt::DBus Qt::Quick KPipeWire Wayland::Client Qt::WaylandClient )
+add_executable(xdp-recordme xdp-main.cpp RecordMe.cpp portalfdutils.cpp recordme.qrc ${XDP_RECORDME_SRCS})
+target_link_libraries(xdp-recordme Qt::DBus Qt::Quick Qt::QuickControls2 KPipeWire)
+
+ecm_add_test(RecordMePortalTest.cpp RecordMe.cpp portalfdutils.cpp ${XDP_RECORDME_SRCS} TEST_NAME RecordMePortalTest LINK_LIBRARIES Qt::Core Qt::DBus Qt::Gui Qt::Quick Qt::QuickControls2 Qt::Test)
+ecm_add_test(HeadlessPortalTest.cpp headlessportalutils.cpp portalfdutils.cpp TEST_NAME HeadlessPortalTest LINK_LIBRARIES Qt::Core Qt::Test)
 
 option(INSTALL_TESTS "The recordme test needs installing, disabled by default for convenience" OFF)
 if(INSTALL_TESTS)
-   configure_file(org.kde.recordme.desktop.cmake ${CMAKE_CURRENT_BINARY_DIR}/org.kde.recordme.desktop @ONLY)
    configure_file(org.kde.kpipewireheadlesstest.desktop.cmake ${CMAKE_CURRENT_BINARY_DIR}/org.kde.kpipewireheadlesstest.desktop @ONLY)
 
-   install(TARGETS recordme kpipewireheadlesstest DESTINATION ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
-   install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/org.kde.recordme.desktop DESTINATION ${KDE_INSTALL_APPDIR})
+   install(TARGETS xdp-recordme kpipewireheadlesstest DESTINATION ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
    install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/org.kde.kpipewireheadlesstest.desktop DESTINATION ${KDE_INSTALL_APPDIR})
-   install(TARGETS xdp-recordme DESTINATION ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
 endif()
 
 add_executable(webcamtest webcamtest.cpp webcamtest.qml webcamtest.qrc)

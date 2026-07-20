@@ -6,6 +6,5 @@
 <!DOCTYPE RCC><RCC version="1.0">
 <qresource>
     <file>main.qml</file>
-    <file>RegionSelector.qml</file>
 </qresource>
 </RCC>
