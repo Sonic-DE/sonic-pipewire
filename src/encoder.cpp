@@ -97,7 +97,7 @@ std::pair<int, int> Encoder::encodeFrame(int maximumFrames)
 
         filtered++;
 
-        if (queued + 1 < maximumFrames) {
+        if (queued < maximumFrames) {
             auto ret = -1;
             {
                 std::lock_guard guard(m_avCodecMutex);

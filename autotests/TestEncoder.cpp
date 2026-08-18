@@ -3,8 +3,11 @@
 
 #include <QtTest>
 
+#include <cstring>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavfilter/buffersrc.h>
 }
 
 #include "encoder_p.h"
@@ -29,9 +32,48 @@ public:
     {
     }
 
-    void processPacket([[maybe_unused]] AVPacket *packet) override
+    void processPacket(AVPacket* packet) override
     {
+        ++receivedPackets;
+        lastPts = packet->pts;
     }
+
+    int receivedPackets = 0;
+    int64_t lastPts = AV_NOPTS_VALUE;
+};
+
+// Feed a synthetic image into the real filter graph without a live PipeWire
+// stream, then exercise the normal encode/receive path without an EOF flush.
+template <typename Base>
+class TestSoftwareEncoder : public Base {
+public:
+    using Base::Base;
+
+    bool filterFrame(const PipeWireFrame& frame) override
+    {
+        auto avFrame = av_frame_alloc();
+        if (!avFrame) {
+            return false;
+        }
+        avFrame->format = AV_PIX_FMT_RGBA;
+        avFrame->width = this->m_avCodecContext->width;
+        avFrame->height = this->m_avCodecContext->height;
+        avFrame->pts = this->m_produce->framePts(frame.presentationTimestamp);
+        if (av_frame_get_buffer(avFrame, 0) < 0) {
+            av_frame_free(&avFrame);
+            return false;
+        }
+        std::memset(avFrame->data[0], 0, avFrame->linesize[0] * avFrame->height);
+        const auto result = av_buffersrc_add_frame(this->m_inputFilter, avFrame);
+        av_frame_free(&avFrame);
+        return result >= 0;
+    }
+};
+
+class TestVAAPIEncoder : public H264VAAPIEncoder {
+public:
+    using H264VAAPIEncoder::buildEncodingOptions;
+    using H264VAAPIEncoder::H264VAAPIEncoder;
 };
 
 // This is a pretty simple smoke test that verifies all the encoders can
@@ -84,7 +126,77 @@ private Q_SLOTS:
             QSKIP("Skipping because hardware encoding is not supported on this device");
         }
 
+        encoder->setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
         QVERIFY(encoder->initialize(QSize(512, 512)));
+    }
+
+    void testSingleFrame_data()
+    {
+        QTest::addColumn<QByteArray>("avcodecEncoder");
+        QTest::addColumn<int>("maximumFrames");
+        for (const auto& codec : {"libx264"_ba, "libopenh264"_ba, "libvpx"_ba, "libvpx-vp9"_ba}) {
+            for (int limit : {1, 2, 3}) {
+                QTest::addRow("%s-limit-%d", codec.constData(), limit) << codec << limit;
+            }
+        }
+    }
+
+    void testSingleFrame()
+    {
+        QFETCH(QByteArray, avcodecEncoder);
+        QFETCH(int, maximumFrames);
+        if (!avcodec_find_encoder_by_name(avcodecEncoder.constData())) {
+            QSKIP("Skipping because the encoder was not found");
+        }
+
+        TestProduce produce;
+        if (avcodecEncoder == "libx264") {
+            produce.m_encoder = std::make_unique<TestSoftwareEncoder<LibX264Encoder>>(Encoder::H264Profile::Main, &produce);
+        } else if (avcodecEncoder == "libopenh264") {
+            produce.m_encoder = std::make_unique<TestSoftwareEncoder<LibOpenH264Encoder>>(Encoder::H264Profile::Main, &produce);
+        } else if (avcodecEncoder == "libvpx") {
+            produce.m_encoder = std::make_unique<TestSoftwareEncoder<LibVpxEncoder>>(&produce);
+        } else {
+            produce.m_encoder = std::make_unique<TestSoftwareEncoder<LibVpxVp9Encoder>>(&produce);
+        }
+        produce.setMaxPendingFrames(maximumFrames);
+        QCOMPARE(produce.maxPendingFrames(), maximumFrames);
+        produce.m_encoder->setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
+        QVERIFY(produce.m_encoder->initialize(QSize(64, 64)));
+
+        PipeWireFrame frame;
+        frame.presentationTimestamp = std::chrono::nanoseconds(0);
+        produce.processFrame(frame);
+        QCOMPARE(produce.m_pendingFilterFrames.load(), 1);
+
+        // Duplicate and too-soon updates must still be throttled after the
+        // first frame, even though that first frame is accepted at PTS zero.
+        produce.processFrame(frame);
+        frame.presentationTimestamp = std::chrono::milliseconds(1);
+        produce.processFrame(frame);
+        QCOMPARE(produce.m_pendingFilterFrames.load(), 1);
+
+        const auto [filtered, queued] = produce.m_encoder->encodeFrame(maximumFrames);
+        QCOMPARE(filtered, 1);
+        QCOMPARE(queued, 1);
+        QCOMPARE(produce.m_encoder->receivePacket(), 1);
+        QCOMPARE(produce.receivedPackets, 1);
+        QCOMPARE(produce.lastPts, 0);
+        QCOMPARE(produce.m_encoder->receivePacket(), 0);
+    }
+
+    void testVAAPILowLatencyOptions()
+    {
+        using Preference = PipeWireBaseEncodedStream::EncodingPreference;
+        TestVAAPIEncoder encoder(Encoder::H264Profile::Main, m_produce.get());
+        for (auto preference : {Preference::NoPreference, Preference::Speed, Preference::Quality, Preference::Size}) {
+            encoder.setEncodingPreference(preference);
+            auto options = encoder.buildEncodingOptions();
+            const auto depth = av_dict_get(options, "async_depth", nullptr, 0);
+            const QByteArray value = depth ? QByteArray(depth->value) : QByteArray();
+            av_dict_free(&options);
+            QCOMPARE(value, preference == Preference::Speed ? "1"_ba : QByteArray());
+        }
     }
 
 private:
