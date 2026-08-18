@@ -90,29 +90,6 @@ void PipeWireProduce::initialize()
             m_processedFrames = 0;
         });
     }
-
-    /**
-     * Kwin only sends a new frame when there's damage on screen
-     * The encoder does not flush all frames whilst a stream is active
-     * it will keep one frame in the queue waiting for more input until the stream is closed
-     *
-     * If there's no update this timer bumps the last frame through the stack again
-     * to flush the last frame.
-     */
-    m_frameRepeatTimer.reset(new QTimer);
-    m_frameRepeatTimer->setSingleShot(true);
-    m_frameRepeatTimer->setInterval(100);
-    connect(m_frameRepeatTimer.data(), &QTimer::timeout, this, [this]() {
-        auto f = m_lastFrame;
-        m_lastFrame = {};
-        aboutToEncode(f);
-        if (!m_encoder->filterFrame(f)) {
-            return;
-        }
-
-        m_pendingFilterFrames++;
-        m_passthroughCondition.notify_all();
-    });
 }
 
 Fraction PipeWireProduce::maxFramerate() const
@@ -124,10 +101,6 @@ void PipeWireProduce::setMaxFramerate(const Fraction &framerate)
 {
     m_maxFramerate = framerate;
 
-    const double framesPerSecond = static_cast<double>(framerate.numerator) / framerate.denominator;
-    if (m_frameRepeatTimer) {
-        m_frameRepeatTimer->setInterval((1000 / framesPerSecond) * 2);
-    }
     if (m_stream) {
         m_stream->setMaxFramerate(framerate);
     }
@@ -140,9 +113,9 @@ int PipeWireProduce::maxPendingFrames() const
 
 void PipeWireProduce::setMaxPendingFrames(int newMaxBufferSize)
 {
-    if (newMaxBufferSize < 3) {
-        qCWarning(PIPEWIRERECORD_LOGGING) << "Maxmimum pending frame count of " << newMaxBufferSize << " requested. Value must be 3 or higher.";
-        newMaxBufferSize = 3;
+    if (newMaxBufferSize < 1) {
+        qCWarning(PIPEWIRERECORD_LOGGING) << "Maxmimum pending frame count of " << newMaxBufferSize << " requested. Value must be 1 or higher.";
+        newMaxBufferSize = 1;
     }
     m_maxPendingFrames = newMaxBufferSize;
 }
@@ -249,8 +222,6 @@ void PipeWireProduce::destroy()
         return;
     }
 
-    m_frameRepeatTimer->stop();
-
     m_frameStatisticsTimer = nullptr;
 
     if (m_passthroughThread.joinable()) {
@@ -302,11 +273,6 @@ void PipeWireProduce::processFrame(const PipeWireFrame &frame)
 {
     auto f = frame;
 
-    m_lastFrame = frame;
-    if (m_enableFrameRepeat) {
-        m_frameRepeatTimer->start();
-    }
-
     if (frame.cursor) {
         m_cursor.position = frame.cursor->position;
         m_cursor.hotspot = frame.cursor->hotspot;
@@ -317,13 +283,17 @@ void PipeWireProduce::processFrame(const PipeWireFrame &frame)
     }
 
     auto pts = framePts(frame.presentationTimestamp);
-    if (m_previousPts >= 0 && pts <= m_previousPts) {
-        return;
-    }
+    // The first frame may be the only update on a static screen. There is no
+    // repeat timer to recover it if its timestamp starts at zero.
+    if (m_previousPts >= 0) {
+        if (pts <= m_previousPts) {
+            return;
+        }
 
-    auto frameTime = 1000.0 / (m_maxFramerate.numerator / m_maxFramerate.denominator);
-    if ((pts - m_previousPts) < frameTime) {
-        return;
+        auto frameTime = 1000.0 / (m_maxFramerate.numerator / m_maxFramerate.denominator);
+        if ((pts - m_previousPts) < frameTime) {
+            return;
+        }
     }
 
     if (m_pendingFilterFrames + 1 > m_maxPendingFrames) {
