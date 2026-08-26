@@ -152,6 +152,9 @@ bool PipeWireRecordProduce::setupFormat()
 void PipeWireRecordProduce::processFrame(const PipeWireFrame &frame)
 {
     PipeWireProduce::processFrame(frame);
+    if (encoderPaused() || m_deactivated || !m_encoder) {
+        return;
+    }
     if (frame.cursor && !frame.dmabuf && !frame.dataFrame && m_frameWithoutMetadataCursor.dataFrame) {
         m_encoder->filterFrame(m_frameWithoutMetadataCursor);
     }

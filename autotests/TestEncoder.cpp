@@ -44,6 +44,58 @@ public:
     int64_t lastPts = AV_NOPTS_VALUE;
 };
 
+class FrameTrackingEncoder : public Encoder {
+public:
+    using Encoder::Encoder;
+
+    bool initialize(const QSize&) override
+    {
+        return true;
+    }
+
+    bool filterFrame(const PipeWireFrame& frame) override
+    {
+        if (!frame.dmabuf && !frame.dataFrame) {
+            return false;
+        }
+        frames.append(frame);
+        processingThread = QThread::currentThread();
+        return true;
+    }
+
+    QList<PipeWireFrame> frames;
+    QThread* processingThread = nullptr;
+
+protected:
+    int percentageToAbsoluteQuality(const std::optional<quint8>&) override
+    {
+        return 0;
+    }
+};
+
+class FrameTrackingProduce : public TestProduce {
+public:
+    void processFrame(const PipeWireFrame& frame) override
+    {
+        PipeWireProduce::processFrame(frame);
+        // Subclasses may still use the argument after the base clears its cache.
+        lastObservedSequence = frame.sequential;
+    }
+
+    std::optional<quint64> lastObservedSequence;
+};
+
+static PipeWireFrame trackingFrame(quint64 sequence, int timestamp)
+{
+    PipeWireFrame frame{};
+    frame.format = SPA_VIDEO_FORMAT_RGBA;
+    frame.sequential = sequence;
+    frame.presentationTimestamp = std::chrono::milliseconds(timestamp);
+    // Only a payload marker for FrameTrackingEncoder, never imported as DMA-BUF.
+    frame.dmabuf = DmaBufAttributes{.width = 64, .height = 64};
+    return frame;
+}
+
 // Feed a synthetic image into the real filter graph without a live PipeWire
 // stream, then exercise the normal encode/receive path without an EOF flush.
 template <typename Base>
@@ -211,6 +263,119 @@ private Q_SLOTS:
         QCOMPARE(produce.receivedPackets, 1);
         QCOMPARE(produce.lastPts, 0);
         QCOMPARE(produce.m_encoder->receivePacket(), 0);
+    }
+
+    void testEncoderPauseDropsAndResumes()
+    {
+        FrameTrackingProduce produce;
+        auto encoder = std::make_unique<FrameTrackingEncoder>(&produce);
+        auto tracker = encoder.get();
+        produce.m_encoder = std::move(encoder);
+        QVERIFY(!produce.encoderPaused());
+
+        std::thread pause([&produce] {
+            produce.setEncoderPaused(true);
+        });
+        pause.join();
+        QVERIFY(produce.encoderPaused());
+        produce.processFrame(trackingFrame(1, 100));
+        produce.processFrame(trackingFrame(2, 200));
+        auto cursorFrame = trackingFrame(3, 300);
+        cursorFrame.dmabuf.reset();
+        cursorFrame.cursor = PipeWireCursor{.position = QPoint(10, 20)};
+        produce.processFrame(cursorFrame);
+        QCOMPARE(tracker->frames.size(), 0);
+        QCOMPARE(produce.m_pendingFilterFrames.load(), 0);
+
+        std::thread resume([&produce] {
+            produce.setEncoderPaused(false);
+        });
+        resume.join();
+        QVERIFY(!produce.encoderPaused());
+        QCOMPARE(tracker->frames.size(), 0);
+        QCoreApplication::sendPostedEvents(&produce, QEvent::MetaCall);
+        QCOMPARE(tracker->frames.size(), 1);
+        QCOMPARE(tracker->frames.constLast().sequential.value(), quint64(2));
+        QCOMPARE(tracker->frames.constLast().cursor->position, QPoint(10, 20));
+        QCOMPARE(tracker->processingThread, produce.thread());
+        QCOMPARE(produce.lastObservedSequence.value(), quint64(2));
+        QVERIFY(!produce.m_lastDroppedFrame.dmabuf);
+
+        produce.setEncoderPaused(false);
+        QCoreApplication::sendPostedEvents(&produce, QEvent::MetaCall);
+        QCOMPARE(tracker->frames.size(), 1);
+    }
+
+    void testEncoderPausePendingResume()
+    {
+        TestProduce produce;
+        auto encoder = std::make_unique<FrameTrackingEncoder>(&produce);
+        auto tracker = encoder.get();
+        produce.m_encoder = std::move(encoder);
+        produce.setEncoderPaused(true);
+        produce.processFrame(trackingFrame(1, 100));
+        produce.setEncoderPaused(false);
+        produce.setEncoderPaused(true);
+        QCoreApplication::sendPostedEvents(&produce, QEvent::MetaCall);
+        QCOMPARE(tracker->frames.size(), 0);
+        QVERIFY(produce.m_lastDroppedFrame.dmabuf);
+
+        produce.setEncoderPaused(false);
+        // A new frame arriving before the queued replay supersedes the cache.
+        produce.processFrame(trackingFrame(2, 200));
+        QCoreApplication::sendPostedEvents(&produce, QEvent::MetaCall);
+        QCOMPARE(tracker->frames.size(), 1);
+        QCOMPARE(tracker->frames.constLast().sequential.value(), quint64(2));
+    }
+
+    void testEncoderPauseWaitsForQueue()
+    {
+        TestProduce produce;
+        auto encoder = std::make_unique<FrameTrackingEncoder>(&produce);
+        auto tracker = encoder.get();
+        produce.m_encoder = std::move(encoder);
+        produce.setMaxPendingFrames(1);
+        produce.m_pendingFilterFrames = 1;
+        produce.setEncoderPaused(true);
+        produce.processFrame(trackingFrame(1, 100));
+        produce.setEncoderPaused(false);
+        QCoreApplication::sendPostedEvents(&produce, QEvent::MetaCall);
+        QCOMPARE(tracker->frames.size(), 0);
+        QVERIFY(produce.m_lastDroppedFrame.dmabuf);
+
+        produce.m_pendingFilterFrames = 0;
+        produce.handleEncodedFramesChanged();
+        QCOMPARE(tracker->frames.size(), 1);
+        QVERIFY(!produce.m_lastDroppedFrame.dmabuf);
+    }
+
+    void testEncoderPauseStopsReplayOnShutdown()
+    {
+        TestProduce produce;
+        auto encoder = std::make_unique<FrameTrackingEncoder>(&produce);
+        auto tracker = encoder.get();
+        produce.m_encoder = std::move(encoder);
+        produce.setEncoderPaused(true);
+        produce.processFrame(trackingFrame(1, 100));
+        produce.setEncoderPaused(false);
+        produce.deactivate();
+        QCoreApplication::sendPostedEvents(&produce, QEvent::MetaCall);
+        produce.processFrame(trackingFrame(2, 200));
+        QCOMPARE(tracker->frames.size(), 0);
+        QVERIFY(!produce.m_lastDroppedFrame.dmabuf);
+    }
+
+    void testEncoderPauseWithoutEncoder()
+    {
+        TestProduce produce;
+        produce.processFrame(trackingFrame(1, 100));
+        produce.setEncoderPaused(true);
+        produce.m_lastDroppedFrame = trackingFrame(2, 200);
+        produce.setEncoderPaused(false);
+        QCoreApplication::sendPostedEvents(&produce, QEvent::MetaCall);
+        QCOMPARE(produce.m_pendingFilterFrames.load(), 0);
+        produce.destroy();
+        QVERIFY(!produce.m_lastDroppedFrame.dmabuf);
     }
 
     void testX264QualityOptions_data()

@@ -67,6 +67,13 @@ public:
     int maxPendingFrames() const;
     void setMaxPendingFrames(int newMaxBufferSize);
 
+    // can be called from any thread
+    void setEncoderPaused(bool encoderPaused);
+    bool encoderPaused() const
+    {
+        return m_encoderPaused;
+    }
+
     virtual int64_t framePts(const std::optional<std::chrono::nanoseconds> &presentationTimestamp)
     {
         return std::chrono::duration_cast<std::chrono::milliseconds>(presentationTimestamp.value()).count();
@@ -153,12 +160,18 @@ public:
 
     std::unique_ptr<QTimer> m_frameStatisticsTimer;
 
+    std::atomic_bool m_encoderPaused = false;
+
+    PipeWireFrame m_lastDroppedFrame;
+
 Q_SIGNALS:
     void producedFrames();
     void started();
     void finished();
 
 private:
+    void flushDroppedFrame();
+
     void initFiltersVaapi();
     void initFiltersSoftware();
 

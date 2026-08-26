@@ -120,6 +120,29 @@ void PipeWireProduce::setMaxPendingFrames(int newMaxBufferSize)
     m_maxPendingFrames = newMaxBufferSize;
 }
 
+void PipeWireProduce::setEncoderPaused(bool encoderPaused)
+{
+    if (m_encoderPaused.exchange(encoderPaused) == encoderPaused) {
+        return;
+    }
+
+    if (!encoderPaused) {
+        QMetaObject::invokeMethod(this, &PipeWireProduce::flushDroppedFrame, Qt::QueuedConnection);
+    }
+}
+
+void PipeWireProduce::flushDroppedFrame()
+{
+    if (m_encoderPaused || m_deactivated || !m_encoder || (!m_lastDroppedFrame.dataFrame && !m_lastDroppedFrame.dmabuf)) {
+        return;
+    }
+
+    // processFrame() clears the cache on admission. Keep a local copy valid
+    // throughout the virtual call, including any subclass handling afterwards.
+    const auto frame = m_lastDroppedFrame;
+    processFrame(frame);
+}
+
 void PipeWireProduce::setupStream()
 {
     qCDebug(PIPEWIRERECORD_LOGGING) << "Setting up stream";
@@ -197,6 +220,7 @@ void PipeWireProduce::setupStream()
 void PipeWireProduce::deactivate()
 {
     m_deactivated = true;
+    m_lastDroppedFrame = {};
 
     auto streamState = PW_STREAM_STATE_PAUSED;
     if (m_stream) {
@@ -217,6 +241,8 @@ void PipeWireProduce::destroy()
     // Ensure we cleanup the PipeWireSourceStream while in the same thread we
     // created it in.
     Q_ASSERT_X(QThread::currentThread() == thread(), "PipeWireProduce", "destroy() called from a different thread than PipeWireProduce's thread");
+
+    m_lastDroppedFrame = {};
 
     if (!m_stream) {
         return;
@@ -271,6 +297,10 @@ void PipeWireProduce::setColorRange(PipeWireBaseEncodedStream::ColorRange colorR
 
 void PipeWireProduce::processFrame(const PipeWireFrame &frame)
 {
+    if (m_deactivated || !m_encoder) {
+        return;
+    }
+
     auto f = frame;
 
     if (frame.cursor) {
@@ -296,10 +326,22 @@ void PipeWireProduce::processFrame(const PipeWireFrame &frame)
         }
     }
 
+    if (m_encoderPaused) {
+        if (frame.dataFrame || frame.dmabuf) {
+            m_lastDroppedFrame = frame;
+        } else if (frame.cursor) {
+            // A cursor-only update must not replace the cached image.
+            m_lastDroppedFrame.cursor = frame.cursor;
+        }
+        return;
+    }
+
     if (m_pendingFilterFrames + 1 > m_maxPendingFrames) {
         qCWarning(PIPEWIRERECORD_LOGGING) << "Filter queue is full, dropping frame" << pts;
         return;
     }
+
+    m_lastDroppedFrame = {};
 
     aboutToEncode(f);
     if (!m_encoder->filterFrame(f)) {
@@ -343,6 +385,9 @@ void PipeWireProduce::stateChanged(pw_stream_state state)
 void PipeWireProduce::handleEncodedFramesChanged()
 {
     if (!m_deactivated) {
+        // Resume may have found the filter queue full. Retry the retained
+        // frame as the existing work drains, even on a now-static screen.
+        flushDroppedFrame();
         return;
     }
 
