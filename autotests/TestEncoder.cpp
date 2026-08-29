@@ -81,6 +81,18 @@ public:
     using LibVpxVp9Encoder::buildEncodingOptions;
     using LibVpxVp9Encoder::LibVpxVp9Encoder;
     using LibVpxVp9Encoder::percentageToAbsoluteQuality;
+
+    bool setFrameHeight(int height)
+    {
+        // An unopened context is sufficient for testing option construction;
+        // no installed libvpx encoder or live PipeWire stream is needed.
+        m_avCodecContext = avcodec_alloc_context3(nullptr);
+        if (!m_avCodecContext) {
+            return false;
+        }
+        m_avCodecContext->height = height;
+        return true;
+    }
 };
 
 // This is a pretty simple smoke test that verifies all the encoders can
@@ -196,18 +208,31 @@ private Q_SLOTS:
     {
         QTest::addColumn<int>("quality");
         QTest::addColumn<int>("expectedCrf");
-        QTest::addRow("default") << -1 << 31;
-        QTest::addRow("lowest") << 0 << 37;
-        QTest::addRow("quarter") << 25 << 31;
-        QTest::addRow("middle") << 50 << 26;
-        QTest::addRow("three-quarters") << 75 << 20;
-        QTest::addRow("highest") << 100 << 15;
+        QTest::addColumn<int>("height");
+        QTest::addRow("default") << -1 << 31 << 0;
+        QTest::addRow("lowest") << 0 << 37 << 0;
+        QTest::addRow("quarter") << 25 << 31 << 0;
+        QTest::addRow("middle") << 50 << 26 << 0;
+        QTest::addRow("three-quarters") << 75 << 20 << 0;
+        QTest::addRow("highest") << 100 << 15 << 0;
+        QTest::addRow("default-720p") << -1 << 31 << 720;
+        QTest::addRow("default-1080p") << -1 << 31 << 1080;
+        QTest::addRow("default-above-1080p") << -1 << 24 << 1081;
+        QTest::addRow("default-1440p") << -1 << 24 << 1440;
+        QTest::addRow("default-above-1440p") << -1 << 15 << 1441;
+        QTest::addRow("default-2160p") << -1 << 15 << 2160;
+        for (int height : {1080, 1440, 2160}) {
+            QTest::addRow("lowest-%dp", height) << 0 << 37 << height;
+            QTest::addRow("middle-%dp", height) << 50 << 26 << height;
+            QTest::addRow("highest-%dp", height) << 100 << 15 << height;
+        }
     }
 
     void testVP9QualityOptions()
     {
         QFETCH(int, quality);
         QFETCH(int, expectedCrf);
+        QFETCH(int, height);
         const auto value = quality < 0 ? std::nullopt : std::optional<quint8>(quality);
         TestVP9Encoder encoder(m_produce.get());
         encoder.setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
@@ -215,6 +240,9 @@ private Q_SLOTS:
         // Conversion must use the argument, not depend on a previously stored
         // quality or an initialized codec context.
         QCOMPARE(encoder.percentageToAbsoluteQuality(value), value ? expectedCrf : -1);
+        if (height > 0) {
+            QVERIFY(encoder.setFrameHeight(height));
+        }
         encoder.setQuality(value);
         auto options = encoder.buildEncodingOptions();
         const auto optionValue = [options](const char* key) {
