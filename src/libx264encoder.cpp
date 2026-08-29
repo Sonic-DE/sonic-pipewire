@@ -11,6 +11,8 @@
 #include <QSize>
 #include <QThread>
 
+#include <cmath>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/buffersink.h>
@@ -97,8 +99,8 @@ int LibX264Encoder::percentageToAbsoluteQuality(const std::optional<quint8> &qua
         return -1;
     }
 
-    constexpr int MinQuality = 51 + 6 * 6;
-    return std::max(1, int(MinQuality - (m_quality.value() / 100.0) * MinQuality));
+    // Lower CRF is higher quality; the recommended range is 17 - 28.
+    return int(std::lerp(28, 17, quality.value() / 100.0));
 }
 
 AVDictionary *LibX264Encoder::buildEncodingOptions()
@@ -107,8 +109,9 @@ AVDictionary *LibX264Encoder::buildEncodingOptions()
 
     // libx264 ignores the AVCodecContext global_quality / qscale fields and
     // requires CRF to be passed as a private option for constant-quality mode.
-    const int crf = m_quality ? percentageToAbsoluteQuality(m_quality) : 35;
-    av_dict_set_int(&options, "crf", crf, 0);
+    // CRF supports fractional values, unlike the integer global_quality field.
+    const qreal crf = m_quality ? std::lerp(28, 17, m_quality.value() / 100.0) : 23;
+    av_dict_set(&options, "crf", QByteArray::number(crf).constData(), 0);
 
     // Disable motion estimation, not great while dragging windows but speeds up encoding by an order of magnitude
     av_dict_set(&options, "flags", "+mv4", 0);
