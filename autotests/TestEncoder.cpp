@@ -3,11 +3,13 @@
 
 #include <QtTest>
 
+#include <cmath>
 #include <cstring>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/buffersrc.h>
+#include <libavutil/opt.h>
 }
 
 #include "encoder_p.h"
@@ -74,6 +76,13 @@ class TestVAAPIEncoder : public H264VAAPIEncoder {
 public:
     using H264VAAPIEncoder::buildEncodingOptions;
     using H264VAAPIEncoder::H264VAAPIEncoder;
+};
+
+class TestX264Encoder : public LibX264Encoder {
+public:
+    using LibX264Encoder::buildEncodingOptions;
+    using LibX264Encoder::LibX264Encoder;
+    using LibX264Encoder::percentageToAbsoluteQuality;
 };
 
 class TestVP9Encoder : public LibVpxVp9Encoder {
@@ -202,6 +211,62 @@ private Q_SLOTS:
         QCOMPARE(produce.receivedPackets, 1);
         QCOMPARE(produce.lastPts, 0);
         QCOMPARE(produce.m_encoder->receivePacket(), 0);
+    }
+
+    void testX264QualityOptions_data()
+    {
+        QTest::addColumn<int>("quality");
+        QTest::addColumn<double>("expectedCrf");
+        QTest::addRow("default") << -1 << 23.0;
+        QTest::addRow("lowest") << 0 << 28.0;
+        QTest::addRow("one-percent") << 1 << 27.89;
+        QTest::addRow("quarter") << 25 << 25.25;
+        QTest::addRow("middle") << 50 << 22.5;
+        QTest::addRow("three-quarters") << 75 << 19.75;
+        QTest::addRow("ninety-nine-percent") << 99 << 17.11;
+        QTest::addRow("highest") << 100 << 17.0;
+    }
+
+    void testX264QualityOptions()
+    {
+        QFETCH(int, quality);
+        QFETCH(double, expectedCrf);
+        const auto value = quality < 0 ? std::nullopt : std::optional<quint8>(quality);
+        TestX264Encoder encoder(Encoder::H264Profile::Main, m_produce.get());
+        encoder.setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
+        QCOMPARE(encoder.percentageToAbsoluteQuality(value), value ? int(expectedCrf) : -1);
+        encoder.setQuality(value);
+        auto options = encoder.buildEncodingOptions();
+        const auto entry = av_dict_get(options, "crf", nullptr, 0);
+        const QByteArray crf = entry ? QByteArray(entry->value) : QByteArray();
+        av_dict_free(&options);
+
+        bool ok = false;
+        const auto actualCrf = crf.toDouble(&ok);
+        QVERIFY(ok);
+        QCOMPARE(actualCrf, expectedCrf);
+    }
+
+    void testX264QualityInitialization_data()
+    {
+        testX264QualityOptions_data();
+    }
+
+    void testX264QualityInitialization()
+    {
+        QFETCH(int, quality);
+        QFETCH(double, expectedCrf);
+        if (!avcodec_find_encoder_by_name("libx264")) {
+            QSKIP("Skipping because the encoder was not found");
+        }
+        TestX264Encoder encoder(Encoder::H264Profile::Main, m_produce.get());
+        encoder.setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
+        encoder.setQuality(quality < 0 ? std::nullopt : std::optional<quint8>(quality));
+        QVERIFY(encoder.initialize(QSize(64, 64)));
+
+        double crf = 0;
+        QCOMPARE(av_opt_get_double(encoder.avCodecContext(), "crf", AV_OPT_SEARCH_CHILDREN, &crf), 0);
+        QVERIFY(std::abs(crf - expectedCrf) < 0.00001);
     }
 
     void testVP9QualityOptions_data()
