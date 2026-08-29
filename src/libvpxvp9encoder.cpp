@@ -14,6 +14,8 @@
 #include <QSize>
 #include <QThread>
 
+#include <cmath>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/buffersink.h>
@@ -74,8 +76,9 @@ int LibVpxVp9Encoder::percentageToAbsoluteQuality(const std::optional<quint8> &q
         return -1;
     }
 
-    constexpr int MinQuality = 63;
-    return std::max(1, int(MinQuality - (m_quality.value() / 100.0) * MinQuality));
+    // Lower CRF is higher quality; the recommended range is 15 - 37.
+    // libvpx-vp9 CRF takes an int.
+    return int(std::lerp(37, 15, quality.value() / 100.0));
 }
 
 AVDictionary *LibVpxVp9Encoder::buildEncodingOptions()
