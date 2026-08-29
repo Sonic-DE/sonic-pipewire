@@ -76,6 +76,13 @@ public:
     using H264VAAPIEncoder::H264VAAPIEncoder;
 };
 
+class TestVP9Encoder : public LibVpxVp9Encoder {
+public:
+    using LibVpxVp9Encoder::buildEncodingOptions;
+    using LibVpxVp9Encoder::LibVpxVp9Encoder;
+    using LibVpxVp9Encoder::percentageToAbsoluteQuality;
+};
+
 // This is a pretty simple smoke test that verifies all the encoders can
 // initialize properly. This verifies that things like filter chains are correct.
 class TestEncoder : public QObject
@@ -183,6 +190,47 @@ private Q_SLOTS:
         QCOMPARE(produce.receivedPackets, 1);
         QCOMPARE(produce.lastPts, 0);
         QCOMPARE(produce.m_encoder->receivePacket(), 0);
+    }
+
+    void testVP9QualityOptions_data()
+    {
+        QTest::addColumn<int>("quality");
+        QTest::addColumn<int>("expectedCrf");
+        QTest::addRow("default") << -1 << 31;
+        QTest::addRow("lowest") << 0 << 37;
+        QTest::addRow("quarter") << 25 << 31;
+        QTest::addRow("middle") << 50 << 26;
+        QTest::addRow("three-quarters") << 75 << 20;
+        QTest::addRow("highest") << 100 << 15;
+    }
+
+    void testVP9QualityOptions()
+    {
+        QFETCH(int, quality);
+        QFETCH(int, expectedCrf);
+        const auto value = quality < 0 ? std::nullopt : std::optional<quint8>(quality);
+        TestVP9Encoder encoder(m_produce.get());
+        encoder.setEncodingPreference(PipeWireBaseEncodedStream::EncodingPreference::Speed);
+
+        // Conversion must use the argument, not depend on a previously stored
+        // quality or an initialized codec context.
+        QCOMPARE(encoder.percentageToAbsoluteQuality(value), value ? expectedCrf : -1);
+        encoder.setQuality(value);
+        auto options = encoder.buildEncodingOptions();
+        const auto optionValue = [options](const char* key) {
+            const auto entry = av_dict_get(options, key, nullptr, 0);
+            return entry ? QByteArray(entry->value) : QByteArray();
+        };
+        const auto crf = optionValue("crf");
+        const auto qmin = optionValue("qmin");
+        const auto qmax = optionValue("qmax");
+        const auto lag = optionValue("lag-in-frames");
+        av_dict_free(&options);
+
+        QCOMPARE(crf, QByteArray::number(expectedCrf));
+        QCOMPARE(qmin, QByteArray::number(expectedCrf / 2));
+        QCOMPARE(qmax, QByteArray::number(int(expectedCrf * 1.5)));
+        QCOMPARE(lag, "0"_ba);
     }
 
     void testVAAPILowLatencyOptions()
