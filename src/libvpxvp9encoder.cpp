@@ -90,6 +90,14 @@ AVDictionary *LibVpxVp9Encoder::buildEncodingOptions()
 
     // Lower crf is higher quality. Max 0, min 63. libvpx-vp9 doesn't use global_quality.
     int crf = 31;
+    // initialize() sets the dimensions before building these options. Keep the
+    // generic default when no codec context is available yet.
+    const auto height = m_avCodecContext ? m_avCodecContext->height : 0;
+    if (height > 1080 && height <= 1440) {
+        crf = 24;
+    } else if (height > 1440) {
+        crf = 15;
+    }
     if (m_quality) {
         crf = percentageToAbsoluteQuality(m_quality);
     }
