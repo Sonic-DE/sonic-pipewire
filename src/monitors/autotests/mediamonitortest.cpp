@@ -16,10 +16,9 @@
 #include <QTemporaryDir>
 #include <QTest>
 
-namespace
-{
-template<typename T>
-[[nodiscard]] T evaluate(QObject *scope, const QString &expression)
+namespace {
+template <typename T>
+[[nodiscard]] T evaluate(QObject* scope, const QString& expression)
 {
     QQmlExpression expr(qmlContext(scope), scope, expression);
     QVariant result = expr.evaluate();
@@ -27,15 +26,15 @@ template<typename T>
     return result.value<T>();
 }
 
-template<>
-void evaluate<void>(QObject *scope, const QString &expression)
+template <>
+void evaluate<void>(QObject* scope, const QString& expression)
 {
     QQmlExpression expr(qmlContext(scope), scope, expression);
     expr.evaluate();
     Q_ASSERT_X(!expr.hasError(), "MediaMonitorTest", qUtf8Printable(expr.error().toString()));
 }
 
-bool initView(QQuickView *view, const QString &urlStr)
+bool initView(QQuickView* view, const QString& urlStr)
 {
     view->setSource(QUrl(urlStr));
 
@@ -68,8 +67,7 @@ void stopProcess(QProcess& process)
 }
 }
 
-class MediaMonitorTest : public QObject
-{
+class MediaMonitorTest : public QObject {
     Q_OBJECT
 
 private Q_SLOTS:
@@ -136,7 +134,7 @@ context.modules = [
     QByteArray errorMessage;
     QVERIFY(initView(&view, QFINDTESTDATA(QStringLiteral("mediamonitortest.qml"))));
 
-    QQuickItem *rootObject = view.rootObject();
+    QQuickItem* rootObject = view.rootObject();
     QSignalSpy countSpy(rootObject, SIGNAL(countChanged()));
 
     player.setProgram(QStringLiteral("pw-play"));
@@ -154,7 +152,7 @@ context.modules = [
     QTRY_COMPARE(evaluate<int>(rootObject, QStringLiteral("root.state")), suspendedInt);
 
     // Changing role will trigger reconnecting
-    QObject *monitor = evaluate<QObject *>(rootObject, QStringLiteral("monitor"));
+    QObject* monitor = evaluate<QObject*>(rootObject, QStringLiteral("monitor"));
     QVERIFY(monitor);
     QSignalSpy detectionAvailableChangedSpy(monitor, SIGNAL(detectionAvailableChanged()));
     QSignalSpy roleChangedSpy(monitor, SIGNAL(roleChanged()));
