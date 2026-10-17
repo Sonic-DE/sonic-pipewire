@@ -6,11 +6,14 @@
 
 #define QT_FORCE_ASSERTS 1
 
+#include <QFile>
+#include <QFileInfo>
 #include <QProcess>
 #include <QQmlExpression>
 #include <QQuickItem>
 #include <QQuickView>
 #include <QSignalSpy>
+#include <QTemporaryDir>
 #include <QTest>
 
 namespace
@@ -51,6 +54,18 @@ bool initView(QQuickView *view, const QString &urlStr)
 
     return true;
 }
+
+void stopProcess(QProcess& process)
+{
+    if (process.state() == QProcess::NotRunning) {
+        return;
+    }
+    process.terminate();
+    if (!process.waitForFinished(5000)) {
+        process.kill();
+        process.waitForFinished(5000);
+    }
+}
 }
 
 class MediaMonitorTest : public QObject
@@ -66,52 +81,56 @@ private Q_SLOTS:
 
 void MediaMonitorTest::test_MediaMonitor()
 {
-    QProcess pipewire;
-    QProcess pipewire_pulse;
-    QProcess wireplumber;
-    QProcess pactl;
-    QScopeGuard guard([&pipewire, &pipewire_pulse, &wireplumber, &pactl] {
-        if (qEnvironmentVariableIsSet("KDECI_BUILD")) {
-            pactl.setArguments({QStringLiteral("unload-module"), QStringLiteral("module-null-sink")});
-            pactl.start();
-            QVERIFY2(pactl.waitForFinished(), pactl.readAllStandardError().constData());
+    QTemporaryDir runtime;
+    QVERIFY(runtime.isValid());
+    const auto oldRuntime = qgetenv("PIPEWIRE_RUNTIME_DIR");
+    const auto oldRemote = qgetenv("PIPEWIRE_REMOTE");
+    QScopeGuard environmentGuard([oldRuntime, oldRemote] {
+        if (oldRuntime.isNull()) {
+            qunsetenv("PIPEWIRE_RUNTIME_DIR");
+        } else {
+            qputenv("PIPEWIRE_RUNTIME_DIR", oldRuntime);
         }
-        if (wireplumber.state() == QProcess::Running) {
-            wireplumber.terminate();
-        }
-        if (pipewire_pulse.state() == QProcess::Running) {
-            pipewire_pulse.terminate();
-        }
-        if (pipewire.state() == QProcess::Running) {
-            pipewire.terminate();
+        if (oldRemote.isNull()) {
+            qunsetenv("PIPEWIRE_REMOTE");
+        } else {
+            qputenv("PIPEWIRE_REMOTE", oldRemote);
         }
     });
+    QVERIFY(qputenv("PIPEWIRE_RUNTIME_DIR", runtime.path().toUtf8()));
+    QVERIFY(qputenv("PIPEWIRE_REMOTE", "pipewire-0"));
 
-    QProcess pidof;
-    pidof.start(QStringLiteral("pidof"), {QStringLiteral("pipewire")});
-    pidof.waitForFinished();
-    if (QString::fromUtf8(pidof.readAllStandardOutput()).toInt() == 0) {
-        pipewire.start(QStringLiteral("pipewire"));
-        QVERIFY2(pipewire.waitForStarted(), pipewire.readAllStandardError().constData());
-        wireplumber.start(QStringLiteral("wireplumber"));
-#ifdef Q_OS_LINUX
-        QVERIFY2(wireplumber.waitForStarted(), wireplumber.readAllStandardError().constData());
-#endif
-        QTest::qWait(1000);
-        pipewire_pulse.start(QStringLiteral("pipewire-pulse"));
-        QVERIFY2(pipewire_pulse.waitForStarted(), pipewire_pulse.readAllStandardError().constData());
-    }
+    // Own the server under test, even when the desktop already has one or more
+    // PipeWire processes. No session manager or physical audio devices are needed
+    // to observe a suspended playback node.
+    QFile config(runtime.filePath(QStringLiteral("pipewire.conf")));
+    QVERIFY(config.open(QIODevice::WriteOnly));
+    const QByteArray configuration = R"(
+context.properties = { core.daemon = true core.name = pipewire-0 }
+context.spa-libs = { audio.convert.* = audioconvert/libspa-audioconvert support.* = support/libspa-support }
+context.modules = [
+    { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-client-node }
+    { name = libpipewire-module-adapter }
+    { name = libpipewire-module-spa-node-factory }
+    { name = libpipewire-module-link-factory }
+    { name = libpipewire-module-metadata }
+    { name = libpipewire-module-access }
+]
+)";
+    QCOMPARE(config.write(configuration), qint64(configuration.size()));
+    config.close();
 
-    // Dummy output
-    if (qEnvironmentVariableIsSet("KDECI_BUILD")) {
-        pactl.setProgram(QStringLiteral("pactl"));
-        pactl.setArguments({QStringLiteral("load-module"),
-                            QStringLiteral("module-null-sink"),
-                            QStringLiteral("sink_name=DummyOutput"),
-                            QStringLiteral("sink_properties=node.nick=DummyOutput")});
-        pactl.start();
-        QVERIFY2(pactl.waitForFinished(), pipewire.readAllStandardError().constData());
-    }
+    QProcess pipewire;
+    QProcess player;
+    QScopeGuard processGuard([&pipewire, &player] {
+        stopProcess(player);
+        stopProcess(pipewire);
+    });
+    pipewire.start(QStringLiteral("pipewire"), {QStringLiteral("-c"), config.fileName()});
+    QVERIFY2(pipewire.waitForStarted(), pipewire.readAllStandardError().constData());
+    QTRY_VERIFY_WITH_TIMEOUT(QFileInfo::exists(runtime.filePath(QStringLiteral("pipewire-0"))), 5000);
+    QCOMPARE(pipewire.state(), QProcess::Running);
 
     QQuickView view;
     QByteArray errorMessage;
@@ -120,7 +139,6 @@ void MediaMonitorTest::test_MediaMonitor()
     QQuickItem *rootObject = view.rootObject();
     QSignalSpy countSpy(rootObject, SIGNAL(countChanged()));
 
-    QProcess player;
     player.setProgram(QStringLiteral("pw-play"));
     player.setArguments({QStringLiteral("-v"), QFINDTESTDATA(QStringLiteral("alarm-clock-elapsed.oga"))});
     player.start();
@@ -132,9 +150,8 @@ void MediaMonitorTest::test_MediaMonitor()
 
     QVERIFY(evaluate<bool>(rootObject, QStringLiteral("monitor.detectionAvailable")));
     QCOMPARE(evaluate<int>(rootObject, QStringLiteral("root.count")), 1);
-    const int runningInt = evaluate<int>(rootObject, QStringLiteral("Monitor.NodeState.Running"));
     const int suspendedInt = evaluate<int>(rootObject, QStringLiteral("Monitor.NodeState.Suspended"));
-    QTRY_COMPARE(evaluate<int>(rootObject, QStringLiteral("root.state")), wireplumber.state() == QProcess::Running ? runningInt : suspendedInt);
+    QTRY_COMPARE(evaluate<int>(rootObject, QStringLiteral("root.state")), suspendedInt);
 
     // Changing role will trigger reconnecting
     QObject *monitor = evaluate<QObject *>(rootObject, QStringLiteral("monitor"));
@@ -165,12 +182,14 @@ void MediaMonitorTest::test_MediaMonitor()
 
     // Now close the player, and check if the count changes
     player.terminate();
+    QVERIFY2(player.waitForFinished(5000), player.readAllStandardError().constData());
     if (evaluate<int>(rootObject, QStringLiteral("root.count")) > 0) {
         QVERIFY(countSpy.wait());
     }
     QCOMPARE(evaluate<int>(rootObject, QStringLiteral("root.count")), 0);
 
     pipewire.terminate();
+    QVERIFY2(pipewire.waitForFinished(5000), pipewire.readAllStandardError().constData());
     QTRY_VERIFY(!evaluate<bool>(rootObject, QStringLiteral("monitor.detectionAvailable")));
 }
 
